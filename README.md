@@ -141,15 +141,15 @@ Example LoRA style entry:
 - Text encoder selections are included in history metadata.
 - Missing text encoder warnings now account for selected overrides.
 
-## Current Scheduled CFG Plan
+## Flux 2 Scheduled CFG Experiment
 
-Scheduled CFG is not implemented yet in this checkpoint.
+Scheduled CFG is implemented as an opt-in Flux 2 sampler preset experiment.
 
-The planned experiment is:
-
-- Detect whether ComfyUI Inspire Pack exposes `ScheduledCFGGuider`.
-- Add a Flux 2 only scheduled CFG path.
-- Route Flux 2 sampling through:
+- The normal Flux 2 presets remain unchanged.
+- Scheduled CFG requires ComfyUI Inspire Pack.
+- If Inspire Pack is missing, the plugin reports a clear error when a Scheduled
+  CFG preset is used.
+- The workflow routes sampling through:
 
 ```text
 positive + negative/empty conditioning + sigmas
@@ -157,7 +157,10 @@ positive + negative/empty conditioning + sigmas
 -> SamplerCustomAdvanced
 ```
 
-- Start with the reported values:
+- Added presets:
+  - `Flux 2 - Euler Scheduled CFG`
+  - `RES4LYF Flux 2 - RES 2M Scheduled CFG`
+- The initial values are:
 
 ```text
 from_cfg: 1.0
@@ -165,8 +168,13 @@ to_cfg: 1.5
 schedule: exp
 ```
 
-This should be compatible with RES4LYF in principle because RES4LYF is the
+This is compatible with RES4LYF in the workflow graph because RES4LYF is the
 sampler input and Scheduled CFG is the guider input to `SamplerCustomAdvanced`.
+If a RES4LYF scheduled preset errors, try the Euler scheduled preset first;
+there is an [upstream Inspire Pack report][inspire-res4lyf-scheduled-cfg]
+for `res_2s` with Scheduled CFGGuider.
+
+[inspire-res4lyf-scheduled-cfg]: https://github.com/ltdrdata/ComfyUI-Inspire-Pack/issues/252
 
 ## Local Development
 

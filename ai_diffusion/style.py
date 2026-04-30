@@ -364,6 +364,9 @@ class SamplerPreset(NamedTuple):
     lora: str | None = None
     minimum_steps: int = 4
     hidden: bool = False
+    cfg_schedule: str = ""
+    cfg_start: float = 1.0
+    cfg_end: float = 1.0
 
 
 class SamplerPresets:

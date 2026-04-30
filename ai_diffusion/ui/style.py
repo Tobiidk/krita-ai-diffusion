@@ -700,6 +700,11 @@ class SamplerWidget(QWidget):
     def _update_info(self):
         preset = self.preset
         text = "<b>" + _("Sampler") + f":</b> {preset.sampler} / {preset.scheduler}"
+        if preset.cfg_schedule:
+            text += (
+                f" +Scheduled CFG {preset.cfg_start:g}->{preset.cfg_end:g}"
+                f" {preset.cfg_schedule}"
+            )
         if preset.lora:
             text += f" +LoRA '{preset.lora}'"
         self._sampler_info.setText(text)

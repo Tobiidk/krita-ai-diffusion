@@ -345,22 +345,34 @@ class ComfyWorkflow:
         steps=20,
         start_at_step=0,
         cfg=7.0,
+        cfg_schedule="",
+        cfg_start=1.0,
+        cfg_end=1.0,
         seed=-1,
         extent: Extent | None = None,
     ):
         self.sample_count += steps - start_at_step
 
+        sigmas = self.scheduler_sigmas(model, scheduler, steps, arch, extent)
+        if start_at_step > 0:
+            _, sigmas = self.split_sigmas(sigmas, start_at_step)
+
         if arch.is_flux_like:
             positive = self.flux_guidance(cond.positive, cfg)
             guider = self.basic_guider(model, positive)
+        elif cfg_schedule:
+            guider, sigmas = self.scheduled_cfg_guider(
+                model,
+                cond,
+                sigmas,
+                from_cfg=cfg_start,
+                to_cfg=cfg_end,
+                schedule=cfg_schedule,
+            )
         elif cfg == 1.0 or not arch.supports_cfg:
             guider = self.basic_guider(model, cond.positive)
         else:
             guider = self.cfg_guider(model, cond, cfg)
-
-        sigmas = self.scheduler_sigmas(model, scheduler, steps, arch, extent)
-        if start_at_step > 0:
-            _, sigmas = self.split_sigmas(sigmas, start_at_step)
 
         return self.add(
             "SamplerCustomAdvanced",
@@ -460,6 +472,39 @@ class ComfyWorkflow:
             positive=cond.positive,
             negative=cond.negative,
             cfg=cfg,
+        )
+
+    def scheduled_cfg_guider(
+        self,
+        model: Output,
+        cond: ConditioningOutput,
+        sigmas: Output,
+        from_cfg=1.0,
+        to_cfg=1.5,
+        schedule="exp",
+    ):
+        candidates = (
+            "ScheduledCFGGuider //Inspire",
+            "ScheduledCFGGuider __Inspire",
+            "InspireScheduledCFGGuider",
+        )
+        node = candidates[0]
+        if self.node_defs:
+            node = next((candidate for candidate in candidates if candidate in self.node_defs), "")
+        if not node:
+            raise RuntimeError(
+                "ComfyUI-Inspire-Pack is required for Flux 2 Scheduled CFG presets."
+            )
+        return self.add(
+            node,
+            output_count=2,
+            model=model,
+            positive=cond.positive,
+            negative=cond.negative,
+            sigmas=sigmas,
+            from_cfg=from_cfg,
+            to_cfg=to_cfg,
+            schedule=schedule,
         )
 
     def flux_guidance(self, conditioning: Output, guidance=3.5):

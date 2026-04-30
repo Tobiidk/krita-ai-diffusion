@@ -411,6 +411,12 @@ class HistoryWidget(QListWidget):
             (_("Steps"), meta.get("steps", "")),
             (_("Guidance"), meta.get("guidance", "")),
         ]
+        if scheduled := meta.get("scheduled_cfg"):
+            if isinstance(scheduled, dict):
+                start = self._format_float(scheduled.get("from", ""))
+                end = self._format_float(scheduled.get("to", ""))
+                schedule = scheduled.get("schedule", "")
+                rows.append((_("Scheduled CFG"), f"{start} -> {end} {schedule}".strip()))
         if "denoise" in meta:
             denoise = f"{float(meta['denoise']) * 100:.0f}%"
             actual = meta.get("actual_steps")

@@ -383,6 +383,12 @@ class Model(QObject, ObservableProperties):
             job_params.metadata["denoise"] = round(input.sampling.denoise_strength, 3)
             job_params.metadata["actual_steps"] = input.sampling.actual_steps
             job_params.metadata["total_steps"] = input.sampling.total_steps
+        if input.sampling and input.sampling.cfg_schedule:
+            job_params.metadata["scheduled_cfg"] = {
+                "from": input.sampling.cfg_scale_start,
+                "to": input.sampling.cfg_scale_end,
+                "schedule": input.sampling.cfg_schedule,
+            }
         return input, job_params, original_conditioning
 
     async def enqueue_jobs(

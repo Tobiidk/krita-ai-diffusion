@@ -7,6 +7,7 @@ from ai_diffusion.api import (
     ExtentInput,
     ImageInput,
     RegionInput,
+    SamplingInput,
     WorkflowInput,
     WorkflowKind,
 )
@@ -35,6 +36,24 @@ def test_serialize_text_encoder_overrides():
 
     assert result.models is not None
     assert result.models.text_encoders == {"qwen_3_4b": "custom-qwen.safetensors"}
+
+
+def test_serialize_scheduled_cfg_sampling():
+    input = WorkflowInput(WorkflowKind.generate)
+    input.sampling = SamplingInput(
+        "res_2m",
+        "flux2",
+        1.0,
+        20,
+        cfg_schedule="exp",
+        cfg_scale_start=1.0,
+        cfg_scale_end=1.5,
+    )
+
+    data = input.to_dict()
+    result = WorkflowInput.from_dict(data)
+
+    assert result.sampling == input.sampling
 
 
 def _ensure_cmp(img: Image | None):

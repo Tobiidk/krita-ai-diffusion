@@ -99,6 +99,18 @@ def test_sampling_denoise_keeps_requested_steps():
     assert sampling.denoise_strength == 0.5
 
 
+def test_sampling_reads_scheduled_cfg_from_sampler_preset():
+    style = Style(Path("flux2.json"))
+    style.sampler = "Flux 2 - Euler Scheduled CFG"
+    style.sampler_steps = 8
+
+    sampling = workflow.sampling_from_style(style, strength=1.0, is_live=False)
+
+    assert sampling.cfg_schedule == "exp"
+    assert sampling.cfg_scale_start == 1.0
+    assert sampling.cfg_scale_end == 1.5
+
+
 def default_style(client: Client, arch=Arch.sd15):
     version_checkpoints = [
         name for name, cp in client.models.checkpoints.items() if cp.arch is arch

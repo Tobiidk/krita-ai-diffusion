@@ -142,3 +142,64 @@ def test_flux2_klein_ignores_guidance_scale(cfg: float):
 
     basic_guider = next(node for node in w.root.values() if node["class_type"] == "BasicGuider")
     assert basic_guider["inputs"]["conditioning"] == [str(positive.node), positive.output]
+
+
+def test_flux2_scheduled_cfg_guider():
+    w = ComfyWorkflow()
+    model = w.add("TestModel", output_count=1)
+    positive = w.add("TestPositiveConditioning", output_count=1)
+    negative = w.add("TestNegativeConditioning", output_count=1)
+    latent = w.add("TestLatent", output_count=1)
+
+    w.sampler_custom_advanced(
+        model,
+        ConditioningOutput(positive, negative),
+        latent,
+        Arch.flux2_4b,
+        sampler="res_2m",
+        scheduler="flux2",
+        steps=5,
+        cfg=1.0,
+        cfg_schedule="exp",
+        cfg_start=1.0,
+        cfg_end=1.5,
+        seed=1234,
+    )
+
+    node_types = [node["class_type"] for node in w.root.values()]
+    assert "ScheduledCFGGuider //Inspire" in node_types
+    assert "BasicGuider" not in node_types
+    assert "CFGGuider" not in node_types
+
+    guider = next(
+        node for node in w.root.values() if node["class_type"] == "ScheduledCFGGuider //Inspire"
+    )
+    assert guider["inputs"]["model"] == [str(model.node), model.output]
+    assert guider["inputs"]["positive"] == [str(positive.node), positive.output]
+    assert guider["inputs"]["negative"] == [str(negative.node), negative.output]
+    assert guider["inputs"]["from_cfg"] == 1.0
+    assert guider["inputs"]["to_cfg"] == 1.5
+    assert guider["inputs"]["schedule"] == "exp"
+
+    sampler = next(node for node in w.root.values() if node["class_type"] == "KSamplerSelect")
+    assert sampler["inputs"]["sampler_name"] == "res_2m"
+
+
+def test_scheduled_cfg_requires_inspire_pack_when_node_defs_are_known(info: ComfyObjectInfo):
+    w = ComfyWorkflow(node_defs=info)
+    model = w.add("TestModel", output_count=1)
+    positive = w.add("TestPositiveConditioning", output_count=1)
+    negative = w.add("TestNegativeConditioning", output_count=1)
+    latent = w.add("TestLatent", output_count=1)
+
+    with pytest.raises(RuntimeError, match="ComfyUI-Inspire-Pack"):
+        w.sampler_custom_advanced(
+            model,
+            ConditioningOutput(positive, negative),
+            latent,
+            Arch.flux2_4b,
+            sampler="euler",
+            scheduler="flux2",
+            steps=5,
+            cfg_schedule="exp",
+        )

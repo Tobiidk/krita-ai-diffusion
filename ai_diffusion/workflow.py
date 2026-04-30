@@ -66,6 +66,9 @@ def sampling_from_style(style: Style, strength: float, is_live: bool):
         scheduler=preset.scheduler,
         cfg_scale=cfg or preset.cfg,
         total_steps=max_steps,
+        cfg_schedule=preset.cfg_schedule,
+        cfg_scale_start=preset.cfg_start,
+        cfg_scale_end=preset.cfg_end,
     )
     if strength < 1.0:
         result.total_steps, result.start_step = apply_denoise_strength(strength, max_steps)
@@ -113,6 +116,9 @@ def _sampler_params(sampling: SamplingInput, extent: Extent, strength: float | N
         "steps": sampling.total_steps,
         "start_at_step": sampling.start_step,
         "cfg": sampling.cfg_scale,
+        "cfg_schedule": sampling.cfg_schedule,
+        "cfg_start": sampling.cfg_scale_start,
+        "cfg_end": sampling.cfg_scale_end,
         "seed": sampling.seed,
         "extent": extent,
     }

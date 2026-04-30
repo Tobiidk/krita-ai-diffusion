@@ -185,7 +185,15 @@ def test_sampler_presets(tmp_path_factory):
     user_file = dir / "user.json"
     user_file.write_text(
         json.dumps({
-            "User": {"sampler": "user_sampler", "scheduler": "normal", "steps": 13, "cfg": 1.0},
+            "User": {
+                "sampler": "user_sampler",
+                "scheduler": "normal",
+                "steps": 13,
+                "cfg": 1.0,
+                "cfg_schedule": "exp",
+                "cfg_start": 1.0,
+                "cfg_end": 1.5,
+            },
         })
     )
 
@@ -196,7 +204,15 @@ def test_sampler_presets(tmp_path_factory):
     assert builtin == SamplerPreset("dpmpp_2m", "normal", 42, 7.0)
 
     user = presets["User"]
-    assert user == SamplerPreset("user_sampler", "normal", 13, 1.0)
+    assert user == SamplerPreset(
+        "user_sampler",
+        "normal",
+        13,
+        1.0,
+        cfg_schedule="exp",
+        cfg_start=1.0,
+        cfg_end=1.5,
+    )
 
     presets.add_missing("DDIM", 99, 2.3)
     assert len(presets) == 3

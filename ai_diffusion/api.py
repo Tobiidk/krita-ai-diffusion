@@ -77,6 +77,9 @@ class SamplingInput:
     total_steps: int
     start_step: int = 0
     seed: int = 0
+    cfg_schedule: str = ""
+    cfg_scale_start: float = 1.0
+    cfg_scale_end: float = 1.0
 
     @property
     def actual_steps(self):
