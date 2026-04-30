@@ -2,6 +2,7 @@ from PyQt5.QtCore import Qt
 
 from ai_diffusion.api import (
     ConditioningInput,
+    CheckpointInput,
     ControlInput,
     ExtentInput,
     ImageInput,
@@ -20,6 +21,20 @@ def test_defaults():
     assert data == {"kind": "refine"}
     result = WorkflowInput.from_dict(data)
     assert result == input
+
+
+def test_serialize_text_encoder_overrides():
+    input = WorkflowInput(WorkflowKind.generate)
+    input.models = CheckpointInput(
+        "flux2.safetensors",
+        text_encoders={"qwen_3_4b": "custom-qwen.safetensors"},
+    )
+
+    data = input.to_dict()
+    result = WorkflowInput.from_dict(data)
+
+    assert result.models is not None
+    assert result.models.text_encoders == {"qwen_3_4b": "custom-qwen.safetensors"}
 
 
 def _ensure_cmp(img: Image | None):

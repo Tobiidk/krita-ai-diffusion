@@ -67,6 +67,7 @@ class JobInfo:
     work: WorkflowInput
     node_count: int = 0
     sample_count: int = 0
+    node_map: dict[str, str] | None = None  # node_id -> class_type
 
     def __str__(self):
         return f"Job[id={self.id}]"
@@ -109,13 +110,24 @@ class QueuedJob:
         return 1 if self._job is not None else 0
 
 
+@dataclass
+class ProgressDetails:
+    """Detailed progress information for display in the UI."""
+    current_node: str = ""       # class_type of the currently executing node
+    sample_step: int = 0         # current sampling step within the node
+    sample_max: int = 0          # total sampling steps for the node
+
+
 class Progress:
     _nodes = 0
     _samples = 0
     _info: JobInfo
+    details: ProgressDetails
 
-    def __init__(self, job_info: JobInfo):
+    def __init__(self, job_info: JobInfo, node_map: dict | None = None):
         self._info = job_info
+        self._node_map = node_map or {}  # node_id -> class_type
+        self.details = ProgressDetails()
 
     def handle(self, msg: dict):
         id = msg["data"].get("prompt_id", None)
@@ -123,10 +135,18 @@ class Progress:
             return
         if msg["type"] == "executing":
             self._nodes += 1
+            node_id = msg["data"].get("node", "")
+            if node_id and node_id in self._node_map:
+                self.details.current_node = self._node_map[node_id]
+            self.details.sample_step = 0
+            self.details.sample_max = 0
         elif msg["type"] == "execution_cached":
             self._nodes += len(msg["data"]["nodes"])
         elif msg["type"] == "progress":
             self._samples += 1
+            data = msg["data"]
+            self.details.sample_step = data.get("value", self.details.sample_step)
+            self.details.sample_max = data.get("max", self.details.sample_max)
 
     @property
     def value(self):
@@ -196,8 +216,8 @@ class ComfyClient(Client):
         models.node_inputs = nodes
         available_resources = client.models.resources = {}
 
-        clip_models = nodes.options("DualCLIPLoader", "clip_name1")
-        clip_models += nodes.options("DualCLIPLoaderGGUF", "clip_name1")
+        clip_models = _list_text_encoder_models(nodes)
+        models.text_encoders = clip_models
         available_resources.update(_find_text_encoder_models(clip_models))
 
         vae_models = nodes.options("VAELoader", "vae_name")
@@ -284,6 +304,14 @@ class ComfyClient(Client):
         self._queue.put(job, front=front)
         return job.id
 
+    async def free_memory(self):
+        """Unload all models and free VRAM on the ComfyUI server."""
+        await self._post("free", {"unload_models": True, "free_memory": True})
+
+    async def get_system_stats(self) -> dict:
+        """Get system stats including VRAM usage from ComfyUI server."""
+        return await self._get("system_stats")
+
     async def _report(self, event: ClientEvent, job_id: str, value: float = 0, **kwargs):
         await self._messages.put(ClientMessage(event, job_id, value, **kwargs))
 
@@ -311,6 +339,11 @@ class ComfyClient(Client):
 
         job.node_count = workflow.node_count
         job.sample_count = workflow.sample_count
+        job.node_map = {
+            nid: node.get("class_type", "")
+            for nid, node in workflow.root.items()
+            if isinstance(node, dict) and "class_type" in node
+        }
         data = {
             "prompt": workflow.root,
             "client_id": self._id,
@@ -371,7 +404,7 @@ class ComfyClient(Client):
                     id = msg["data"]["prompt_id"]
                     self._active_job = await self._start_job(id)
                     if self._active_job is not None:
-                        progress = Progress(self._active_job)
+                        progress = Progress(self._active_job, self._active_job.node_map)
                         images = ImageCollection()
                         result = None
 
@@ -401,7 +434,8 @@ class ComfyClient(Client):
                     if self._active_job is not None and progress is not None:
                         progress.handle(msg)
                         await self._report(
-                            ClientEvent.progress, self._active_job.id, progress.value
+                            ClientEvent.progress, self._active_job.id, progress.value,
+                            progress_details=progress.details,
                         )
                     else:
                         log.warning(f"Received message {msg} but there is no active job")
@@ -529,6 +563,7 @@ class ComfyClient(Client):
             models.checkpoints.update(parse_model_info(diffusion_models, FileFormat.diffusion))
 
         models.vae = nodes.options("VAELoader", "vae_name")
+        models.text_encoders = _list_text_encoder_models(nodes)
         models.loras = nodes.options("LoraLoader", "lora_name")
 
         if "UnetLoaderGGUF" in nodes:
@@ -745,6 +780,23 @@ def _find_model(
 
 def find_model(model_list: Sequence[str], id: ResourceId):
     return _find_model(model_list, id.kind, id.arch, id.identifier)
+
+
+def _list_text_encoder_models(nodes: ComfyObjectInfo):
+    result: list[str] = []
+    for node, inputs in {
+        "CLIPLoader": ["clip_name"],
+        "CLIPLoaderGGUF": ["clip_name"],
+        "DualCLIPLoader": ["clip_name1", "clip_name2"],
+        "DualCLIPLoaderGGUF": ["clip_name1", "clip_name2"],
+        "TripleCLIPLoader": ["clip_name1", "clip_name2", "clip_name3"],
+        "TripleCLIPLoaderGGUF": ["clip_name1", "clip_name2", "clip_name3"],
+    }.items():
+        for input_name in inputs:
+            for model in nodes.options(node, input_name):
+                if model not in result:
+                    result.append(model)
+    return result
 
 
 def _find_text_encoder_models(model_list: Sequence[str]):

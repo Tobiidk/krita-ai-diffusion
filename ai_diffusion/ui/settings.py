@@ -13,7 +13,6 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -49,6 +48,7 @@ from .server import ServerWidget
 from .settings_widgets import (
     ComboBoxSetting,
     FileListSetting,
+    NoWheelComboBox,
     SettingsTab,
     SliderSetting,
     SpinBoxSetting,
@@ -716,6 +716,15 @@ class InterfaceSettings(SettingsTab):
         )
         self.add("show_steps", SwitchSetting(S._show_steps, parent=self))
         self.add("recent_styles_count", SpinBoxSetting(S._recent_styles_count, self, 0, 10))
+        self.add("history_show_prompt", SwitchSetting(S._history_show_prompt, parent=self))
+        self.add(
+            "history_show_prompt_evaluated",
+            SwitchSetting(S._history_show_prompt_evaluated, parent=self),
+        )
+        self.add(
+            "history_show_prompt_final",
+            SwitchSetting(S._history_show_prompt_final, parent=self),
+        )
 
         self.add("tag_files", FileListSetting(S._tag_files, files=self._tag_files(), parent=self))
         self._layout.addWidget(self._widgets["tag_files"].list_widget)
@@ -850,7 +859,7 @@ class PerformanceSettings(SettingsTab):
         self._device_info.setStyleSheet("font-style:italic")
         self._layout.addWidget(self._device_info)
 
-        self._performance_preset = QComboBox(self)
+        self._performance_preset = NoWheelComboBox(self)
         for preset in PerformancePreset:
             self._performance_preset.addItem(preset.value)
         self._performance_preset.currentIndexChanged.connect(self._change_performance_preset)

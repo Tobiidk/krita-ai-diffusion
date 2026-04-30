@@ -8,7 +8,6 @@ from PyQt5.QtCore import Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor, QDesktopServices, QPalette
 from PyQt5.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QCompleter,
     QFileDialog,
     QFrame,
@@ -16,6 +15,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QToolButton,
@@ -36,6 +36,7 @@ from .settings_widgets import (
     ComboBoxSetting,
     ExpanderButton,
     LineEditSetting,
+    NoWheelComboBox,
     SettingsTab,
     SettingWidget,
     SliderSetting,
@@ -49,9 +50,51 @@ from .theme import SignalBlocker, add_header, icon
 from .widget import create_framed_label
 
 
+class DragHandle(QToolButton):
+    drag_started = pyqtSignal()
+    drag_moved = pyqtSignal(int)
+    drag_finished = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging = False
+        self.setText("::")
+        self.setFixedWidth(18)
+        self.setAutoRaise(True)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip(_("Drag to reorder"))
+
+    def mousePressEvent(self, event):
+        if event and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self.drag_started.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and event:
+            self.drag_moved.emit(self.mapToGlobal(event.pos()).y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self.drag_finished.emit()
+            if event:
+                event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class LoraItem(QWidget):
     changed = pyqtSignal()
     removed = pyqtSignal(QWidget)
+    drag_started = pyqtSignal(QWidget)
+    drag_moved = pyqtSignal(QWidget, int)
+    drag_finished = pyqtSignal(QWidget)
 
     def __init__(self, loras: FileFilter, parent=None):
         super().__init__(parent)
@@ -74,7 +117,7 @@ class LoraItem(QWidget):
         self._advanced_button = ExpanderButton(parent=self)
         self._advanced_button.toggled.connect(self._expand)
 
-        self._select = QComboBox(self)
+        self._select = NoWheelComboBox(self)
         self._select.setEditable(True)
         self._select.setModel(self._loras)
         self._select.setCompleter(completer)
@@ -107,8 +150,14 @@ class LoraItem(QWidget):
         self._remove.setIcon(icon("discard"))
         self._remove.clicked.connect(self.remove)
 
+        self._drag_handle = DragHandle(self)
+        self._drag_handle.drag_started.connect(lambda: self.drag_started.emit(self))
+        self._drag_handle.drag_moved.connect(lambda y: self.drag_moved.emit(self, y))
+        self._drag_handle.drag_finished.connect(lambda: self.drag_finished.emit(self))
+
         item_layout = QHBoxLayout()
         item_layout.setContentsMargins(0, 0, 0, 0)
+        item_layout.addWidget(self._drag_handle)
         item_layout.addLayout(expander_layout, 3)
         item_layout.addWidget(self._enabled)
         item_layout.addWidget(self._strength, 1)
@@ -121,6 +170,19 @@ class LoraItem(QWidget):
         self._warning_text = QLabel(self._advanced)
         self._warning_text.setStyleSheet(f"color: {theme.yellow}; font-weight: bold;")
         self._warning_text.setVisible(False)
+
+        display_name_label = QLabel(_("Display name"), parent=self._advanced)
+        display_name_help = _("Optional name shown in the docker instead of the file name")
+        self._display_name_edit = QLineEdit(parent=self._advanced)
+        self._display_name_edit.setPlaceholderText(display_name_help)
+        self._display_name_edit.textChanged.connect(self._notify_changed)
+
+        description_label = QLabel(_("Description"), parent=self._advanced)
+        description_help = _("Optional notes shown when hovering this LoRA in the docker")
+        self._description_edit = QPlainTextEdit(parent=self._advanced)
+        self._description_edit.setPlaceholderText(description_help)
+        self._description_edit.setFixedHeight(58)
+        self._description_edit.textChanged.connect(self._notify_changed)
 
         trigger_label = QLabel(_("Trigger words"), parent=self._advanced)
         trigger_help = _("Optional text which is added to the prompt when the LoRA is used")
@@ -160,6 +222,10 @@ class LoraItem(QWidget):
         advanced_layout = QVBoxLayout()
         advanced_layout.setContentsMargins(3, 2, 0, 2)
         advanced_layout.addWidget(self._warning_text)
+        advanced_layout.addWidget(display_name_label)
+        advanced_layout.addWidget(self._display_name_edit)
+        advanced_layout.addWidget(description_label)
+        advanced_layout.addWidget(self._description_edit)
         advanced_layout.addLayout(meta_layout)
         advanced_layout.addWidget(self._file_id_label)
         advanced_layout.addWidget(self._file_path_label)
@@ -218,6 +284,10 @@ class LoraItem(QWidget):
         file = root.files.loras.find(id)
         if file and file != self._current:
             self._current = file
+            with SignalBlocker(self._display_name_edit):
+                self._display_name_edit.clear()
+            with SignalBlocker(self._description_edit):
+                self._description_edit.clear()
             default_strength = int(file.meta("lora_strength", 1.0) * 100)
             if default_strength != self._strength.value():
                 self._strength.setValue(default_strength)
@@ -252,11 +322,16 @@ class LoraItem(QWidget):
     def value(self):
         if self._current is None:
             return {"name": "", "strength": 1.0, "enabled": True}
-        return {
+        result = {
             "name": self._current.id,
             "strength": self.strength,
             "enabled": self._enabled.isChecked(),
         }
+        if display_name := self._display_name_edit.text().strip():
+            result["display_name"] = display_name
+        if description := self._description_edit.toPlainText().strip():
+            result["description"] = description
+        return result
 
     @value.setter
     def value(self, v: dict):
@@ -269,8 +344,12 @@ class LoraItem(QWidget):
                 self._select.setCurrentIndex(index)
             else:
                 self._select.setEditText(self._current.name)
-        self.strength = v["strength"]
+        self.strength = v.get("strength", 1.0)
         self._enabled.setChecked(v.get("enabled", True))
+        with SignalBlocker(self._display_name_edit):
+            self._display_name_edit.setText(v.get("display_name", ""))
+        with SignalBlocker(self._description_edit):
+            self._description_edit.setPlainText(v.get("description", ""))
         self._update()
 
     @property
@@ -296,6 +375,10 @@ class LoraItem(QWidget):
         self._current = None
         self.strength = 1.0
         self._enabled.setChecked(True)
+        with SignalBlocker(self._display_name_edit):
+            self._display_name_edit.clear()
+        with SignalBlocker(self._description_edit):
+            self._description_edit.clear()
         self._select.setCurrentIndex(0)
         if self._loras.rowCount() > 0:
             self._select_lora()
@@ -327,6 +410,16 @@ _special_lora_warning = _(
 )
 
 
+_text_encoder_labels = {
+    "clip_l": "CLIP-L",
+    "clip_g": "CLIP-G",
+    "t5": "T5",
+    "qwen": "Qwen",
+    "qwen_3_4b": "Qwen 3 4B",
+    "qwen_3_8b": "Qwen 3 8B",
+}
+
+
 class LoraList(QWidget):
     value_changed = pyqtSignal()
 
@@ -336,6 +429,8 @@ class LoraList(QWidget):
     def __init__(self, setting: Setting, parent=None):
         super().__init__(parent)
         self._items: list[LoraItem] = []
+        self._drag_item: LoraItem | None = None
+        self._drag_changed = False
         self._loras = FileFilter(root.files.loras)
         self._loras.available_only = True
 
@@ -359,7 +454,7 @@ class LoraList(QWidget):
         self._upload_button.clicked.connect(self._upload_lora)
         header_layout.addWidget(self._upload_button, 1)
 
-        self._filter_combo = QComboBox(self)
+        self._filter_combo = NoWheelComboBox(self)
         self._filter_combo.currentIndexChanged.connect(self._set_filtered_names)
         header_layout.addWidget(self._filter_combo, 2)
 
@@ -398,6 +493,9 @@ class LoraList(QWidget):
             item = LoraItem(self._loras, parent=self)
             item.changed.connect(self._update_item)
             item.removed.connect(self._remove_item)
+            item.drag_started.connect(self._start_drag)
+            item.drag_moved.connect(self._move_drag)
+            item.drag_finished.connect(self._finish_drag)
             self._items.append(item)
 
         if isinstance(lora, dict):
@@ -411,12 +509,62 @@ class LoraList(QWidget):
 
     def _remove_item(self, item: QWidget):
         # removing and creating items is slow, hiding allows reuse
+        if item is self._drag_item:
+            self._drag_item = None
+            self._drag_changed = False
         item.is_active = False
         self._item_list.removeWidget(item)
         self.value_changed.emit()
 
     def _update_item(self):
         self.value_changed.emit()
+
+    def _active_items(self):
+        result = []
+        for i in range(self._item_list.count()):
+            if item := self._item_list.itemAt(i):
+                widget = item.widget()
+                if isinstance(widget, LoraItem) and widget.is_active:
+                    result.append(widget)
+        return result
+
+    def _set_active_order(self, items: list[LoraItem]):
+        for item in self._active_items():
+            self._item_list.removeWidget(item)
+        for item in items:
+            self._item_list.addWidget(item)
+
+    def _start_drag(self, item: QWidget):
+        if isinstance(item, LoraItem) and item.is_active:
+            self._drag_item = item
+            self._drag_changed = False
+            item.setStyleSheet(f"QWidget {{ background-color: {theme.line}; }}")
+
+    def _move_drag(self, item: QWidget, global_y: int):
+        if item is not self._drag_item or not isinstance(item, LoraItem):
+            return
+        active = self._active_items()
+        if item not in active:
+            return
+        others = [i for i in active if i is not item]
+        target = len(others)
+        for i, other in enumerate(others):
+            center_y = other.mapToGlobal(other.rect().center()).y()
+            if global_y < center_y:
+                target = i
+                break
+        reordered = others[:target] + [item] + others[target:]
+        if reordered != active:
+            self._set_active_order(reordered)
+            self._drag_changed = True
+
+    def _finish_drag(self, item: QWidget):
+        if item is self._drag_item:
+            item.setStyleSheet("")
+            self._drag_item = None
+            if self._drag_changed:
+                self.value_changed.emit()
+            self._drag_changed = False
 
     def _collect_filters(self):
         with SignalBlocker(self._filter_combo):
@@ -467,7 +615,7 @@ class LoraList(QWidget):
 
     @property
     def value(self):
-        return [item.value for item in self._items if item.is_active]
+        return [item.value for item in self._active_items()]
 
     @value.setter
     def value(self, v: list[dict | File]):
@@ -493,7 +641,7 @@ class SamplerWidget(QWidget):
 
         expander = ExpanderButton(title, self)
 
-        self._preset = QComboBox(self)
+        self._preset = NoWheelComboBox(self)
         self._preset.addItems(SamplerPresets.instance().names())
         self._preset.setMinimumWidth(230)
         self._preset.currentIndexChanged.connect(self._select_preset)
@@ -565,6 +713,9 @@ class SamplerWidget(QWidget):
     def notify_changed(self):
         self.value_changed.emit()
 
+    def set_guidance_visible(self, visible: bool):
+        self._cfg.setVisible(visible)
+
     def read(self, style: Style):
         self._preset.setCurrentText(getattr(style, f"{self.prefix}sampler"))
         self._steps.value = getattr(style, f"{self.prefix}sampler_steps")
@@ -579,14 +730,16 @@ class SamplerWidget(QWidget):
 
 class StylePresets(SettingsTab):
     _checkpoint_advanced_widgets: list[SettingWidget]
+    _text_encoder_widgets: dict[str, ComboBoxSetting]
     _default_sampler_widgets: list[SettingWidget]
     _live_sampler_widgets: list[SettingWidget]
 
     def __init__(self, server: Server):
         super().__init__(_("Style Presets"))
         self.server = server
+        self._checkpoint_advanced_expanded = False
 
-        self._style_list = QComboBox(self)
+        self._style_list = NoWheelComboBox(self)
         self._style_list.currentIndexChanged.connect(self._change_style)
 
         self._create_style_button = QToolButton(self)
@@ -686,6 +839,17 @@ class StylePresets(SettingsTab):
             "architecture", ComboBoxSetting(StyleSettings.architecture, parent=self)
         )
         self._vae = add("vae", ComboBoxSetting(StyleSettings.vae, parent=self))
+        self._text_encoder_widgets = {}
+        for role, label in _text_encoder_labels.items():
+            setting = Setting(
+                _("Text Encoder") + f" ({label})",
+                "",
+                _("Override the text encoder model used by this style."),
+            )
+            widget = ComboBoxSetting(setting, parent=self)
+            widget.value_changed.connect(self.write)
+            self._layout.addWidget(widget)
+            self._text_encoder_widgets[role] = widget
 
         self._clip_skip = add("clip_skip", SpinBoxSetting(StyleSettings.clip_skip, self, 0, 12))
         self._clip_skip_check = self._clip_skip.add_checkbox(_("Override"))
@@ -710,6 +874,7 @@ class StylePresets(SettingsTab):
         self._checkpoint_advanced_widgets = [
             self._arch_select,
             self._vae,
+            *self._text_encoder_widgets.values(),
             self._clip_skip,
             self._resolution_spin,
             self._zsnr,
@@ -829,7 +994,9 @@ class StylePresets(SettingsTab):
         self._checkpoint_warning.setVisible(False)
         if client := root.connection.client_if_connected:
             warn = []
-            preferred_cp = self.current_style.preferred_checkpoint(client.models.checkpoints.keys())
+            preferred_cp = self.current_style.preferred_checkpoint(
+                client.models.checkpoints.keys()
+            )
             file = root.files.checkpoints.find(preferred_cp)
             if file is None:
                 warn.append(_("The checkpoint used by this style is not installed."))
@@ -843,7 +1010,7 @@ class StylePresets(SettingsTab):
                     )
                 )
 
-            if file and file.format is FileFormat.diffusion:
+            if file and (file.format is FileFormat.diffusion or arch is Arch.sd3):
                 vae_id = ResourceId(ResourceKind.vae, arch, "default")
                 if client.models.resources.get(vae_id.string) is None:
                     paths = search_paths.get(vae_id.string, [])
@@ -852,7 +1019,11 @@ class StylePresets(SettingsTab):
                     warn.append(text)
                 for te in arch.text_encoders:
                     te_id = ResourceId(ResourceKind.text_encoder, Arch.all, te)
-                    if client.models.resources.get(te_id.string) is None:
+                    if override := self.current_style.text_encoders.get(te):
+                        if override not in client.models.text_encoders:
+                            text = _("The text encoder for this diffusion model is not installed")
+                            warn.append(f"{text}: {override}")
+                    elif client.models.resources.get(te_id.string) is None:
                         paths = search_paths.get(te_id.string, [])
                         text = _("The text encoder for this diffusion model is not installed")
                         text += ": " + ", ".join(str(p) for p in paths)
@@ -891,6 +1062,48 @@ class StylePresets(SettingsTab):
         self._set_checkpoint_warning()
         self._show_edit_style(style)
 
+    def _set_text_encoder_items(self, style: Style):
+        models = []
+        if client := root.connection.client_if_connected:
+            models = list(client.models.text_encoders)
+        for value in style.text_encoders.values():
+            if value and value not in models:
+                models.append(value)
+        items = [(_("Default"), "")] + [(m, m) for m in models]
+        for widget in self._text_encoder_widgets.values():
+            widget.set_items(items)
+
+    def _read_text_encoders(self, style: Style):
+        self._set_text_encoder_items(style)
+        for role, widget in self._text_encoder_widgets.items():
+            widget.value = style.text_encoders.get(role, "")
+        self._update_text_encoder_visibility()
+
+    def _write_text_encoders(self, style: Style):
+        arch = resolve_arch(style, root.connection.client_if_connected)
+        style.text_encoders = {
+            role: value
+            for role in arch.text_encoders
+            if (value := self._text_encoder_widgets[role].value)
+        }
+
+    def _uses_external_text_encoders(self, arch: Arch):
+        if client := root.connection.client_if_connected:
+            checkpoint = self.current_style.preferred_checkpoint(client.models.checkpoints.keys())
+            if info := client.models.checkpoints.get(checkpoint):
+                return info.format is FileFormat.diffusion or arch is Arch.sd3
+        return True
+
+    def _update_text_encoder_visibility(self):
+        arch = resolve_arch(self.current_style, root.connection.client_if_connected)
+        uses_external = self._uses_external_text_encoders(arch)
+        for role, widget in self._text_encoder_widgets.items():
+            widget.visible = (
+                self._checkpoint_advanced_expanded
+                and uses_external
+                and role in arch.text_encoders
+            )
+
     def _toggle_preferred_resolution(self, checked: bool):
         if checked and self._resolution_spin.value == 0:
             sd_ver = resolve_arch(self.current_style, root.connection.client_if_connected)
@@ -906,8 +1119,10 @@ class StylePresets(SettingsTab):
             self._clip_skip.value = 0
 
     def _toggle_checkpoint_advanced(self, checked: bool):
+        self._checkpoint_advanced_expanded = checked
         for widget in self._checkpoint_advanced_widgets:
             widget.visible = checked
+        self._update_text_encoder_visibility()
 
     def _show_builtin_info(self, style: Style):
         is_builtin = Styles.list().is_builtin(style)
@@ -942,6 +1157,9 @@ class StylePresets(SettingsTab):
         self._clip_skip.enabled = arch.supports_clip_skip and self.current_style.clip_skip > 0
         self._zsnr.enabled = arch.supports_attention_guidance
         self._sag.enabled = arch.supports_attention_guidance
+        self._default_sampler.set_guidance_visible(arch.supports_guidance_scale)
+        self._live_sampler.set_guidance_visible(arch.supports_guidance_scale)
+        self._update_text_encoder_visibility()
 
     def _read_style(self, style: Style):
         with self._write_guard:
@@ -951,6 +1169,7 @@ class StylePresets(SettingsTab):
             self._live_sampler.read(style)
         self._show_builtin_info(style)
         self._read_checkpoint(style)
+        self._read_text_encoders(style)
         self._enable_checkpoint_advanced()
         self._resolution_spin.enabled = style.preferred_resolution > 0
 
@@ -970,6 +1189,7 @@ class StylePresets(SettingsTab):
             if widget.value is not None:
                 setattr(style, name, widget.value)
         self._write_checkpoint(style)
+        self._write_text_encoders(style)
         self._default_sampler.write(style)
         self._live_sampler.write(style)
         self._enable_checkpoint_advanced()

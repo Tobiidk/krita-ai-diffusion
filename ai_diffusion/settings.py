@@ -384,6 +384,16 @@ class Settings(QObject):
         ],
     )
 
+    quick_styles: list[str]
+    _quick_styles = Setting(
+        _("Quick Generate Styles"),
+        [],
+        _("Styles shown as one-click generate buttons in the docker"),
+    )
+
+    lora_docker_visible_rows: int
+    _lora_docker_visible_rows = Setting("LoRA docker visible rows", 10)
+
     history_size: int
     _history_size = Setting(
         _("Active History Size"),
@@ -403,6 +413,27 @@ class Settings(QObject):
         _("History Format"),
         ImageFileFormat.webp,
         _("File format for saving generated images in history"),
+    )
+
+    history_show_prompt: bool
+    _history_show_prompt = Setting(
+        _("History: Prompt"),
+        True,
+        _("Show the raw prompt and negative prompt in generated image history details"),
+    )
+
+    history_show_prompt_evaluated: bool
+    _history_show_prompt_evaluated = Setting(
+        _("History: Prompt Evaluated"),
+        True,
+        _("Show wildcard-evaluated prompts in generated image history details"),
+    )
+
+    history_show_prompt_final: bool
+    _history_show_prompt_final = Setting(
+        _("History: Prompt Final"),
+        True,
+        _("Show the final prompts sent to the workflow in generated image history details"),
     )
 
     multi_threading: bool

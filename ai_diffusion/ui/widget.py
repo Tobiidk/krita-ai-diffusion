@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from itertools import chain
+from textwrap import fill
 from typing import Any, ClassVar, cast
 
 from krita import Krita
-from PyQt5.QtCore import QEvent, QMetaObject, QSize, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QEvent, QMetaObject, QPoint, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import (
     QCloseEvent,
     QColor,
@@ -34,6 +35,8 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QScrollArea,
+    QVBoxLayout,
     QPlainTextEdit,
     QPushButton,
     QScrollBar,
@@ -78,9 +81,11 @@ from ..text import (
     str_index_to_char16_index,
 )
 from ..util import ensure
-from ..workflow import apply_strength, snap_to_percent
+from ..workflow import apply_denoise_strength, snap_to_percent
+from .. import eventloop
 from . import actions, theme
 from .autocomplete import PromptAutoComplete
+from .switch import SwitchWidget
 from .theme import SignalBlocker
 
 
@@ -710,9 +715,9 @@ class StrengthSnapping:
         return snap_to_percent(steps, start_at_step, max_steps=max_steps)
 
     def apply_strength(self, value: int) -> tuple[int, int]:
-        min_steps, max_steps = self.get_steps()
         strength = value / 100
-        return apply_strength(strength, steps=max_steps, min_steps=min_steps)
+        _, max_steps = self.get_steps()
+        return apply_denoise_strength(strength, steps=max_steps)
 
 
 # SpinBox variant that allows manually entering strength values,
@@ -748,7 +753,13 @@ class StrengthWidget(QWidget):
 
     value_changed = pyqtSignal(float)
 
-    def __init__(self, slider_range: tuple[int, int] = (1, 100), prefix=True, parent=None):
+    def __init__(
+        self,
+        slider_range: tuple[int, int] = (1, 100),
+        prefix=True,
+        parent=None,
+        label: str | None = None,
+    ):
         super().__init__(parent)
         self._layout = QHBoxLayout()
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -764,7 +775,7 @@ class StrengthWidget(QWidget):
         self._input = StrengthSpinBox(self)
         self._input.setValue(self._value)
         if prefix:
-            self._input.setPrefix(_("Strength") + ": ")
+            self._input.setPrefix((label or _("Strength")) + ": ")
         self._input.setSuffix("%")
         self._input.setSpecialValueText(_("Off"))
         self._input.valueChanged.connect(self.notify_changed)
@@ -827,6 +838,621 @@ class StrengthWidget(QWidget):
 
         steps, start_at_step = self._input.snapping.apply_strength(self._value)
         self._input.setSuffix(f"% ({steps - start_at_step}/{steps})")
+
+
+class StyleParamsWidget(QWidget):
+    """Compact steps/guidance sliders for the main docker, bound to the active style."""
+
+    _model: Model | None = None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.setLayout(layout)
+
+        # Steps slider
+        steps_row = QHBoxLayout()
+        steps_row.setContentsMargins(0, 0, 0, 0)
+        self._steps_label = QLabel(_("Steps") + ":", self)
+        self._steps_label.setFixedWidth(64)
+        self._steps_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._steps_slider.setMinimum(1)
+        self._steps_slider.setMaximum(100)
+        self._steps_slider.setSingleStep(1)
+        self._steps_spin = QSpinBox(self)
+        self._steps_spin.setMinimum(1)
+        self._steps_spin.setMaximum(100)
+        self._steps_spin.setFixedWidth(50)
+        self._steps_slider.valueChanged.connect(self._steps_slider_moved)
+        self._steps_spin.editingFinished.connect(self._steps_committed)
+        steps_row.addWidget(self._steps_label)
+        steps_row.addWidget(self._steps_slider)
+        steps_row.addWidget(self._steps_spin)
+        layout.addLayout(steps_row)
+
+        # Guidance slider
+        cfg_row = QHBoxLayout()
+        cfg_row.setContentsMargins(0, 0, 0, 0)
+        self._cfg_label = QLabel(_("Guidance") + ":", self)
+        self._cfg_label.setFixedWidth(64)
+        self._cfg_label.setToolTip(_("Guidance Strength (CFG Scale)"))
+        self._cfg_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._cfg_slider.setMinimum(10)  # 1.0 * 10
+        self._cfg_slider.setMaximum(200)  # 20.0 * 10
+        self._cfg_slider.setSingleStep(1)
+        self._cfg_spin = QDoubleSpinBox(self)
+        self._cfg_spin.setMinimum(1.0)
+        self._cfg_spin.setMaximum(20.0)
+        self._cfg_spin.setSingleStep(0.5)
+        self._cfg_spin.setDecimals(1)
+        self._cfg_spin.setFixedWidth(58)
+        self._cfg_slider.valueChanged.connect(self._cfg_slider_moved)
+        self._cfg_spin.editingFinished.connect(self._cfg_committed)
+        cfg_row.addWidget(self._cfg_label)
+        cfg_row.addWidget(self._cfg_slider)
+        cfg_row.addWidget(self._cfg_spin)
+        layout.addLayout(cfg_row)
+        self._cfg_widgets = (self._cfg_label, self._cfg_slider, self._cfg_spin)
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        if self._model is not None:
+            self._model.effective_style_changed.disconnect(self._read_from_style)
+        self._model = model
+        model.effective_style_changed.connect(self._read_from_style)
+        self._read_from_style()
+
+    def _read_from_style(self):
+        """Refresh slider values from the current effective style and workspace."""
+        if self._model is None:
+            return
+        steps, cfg = self._model.effective_sampler_values()
+        supports_guidance = self._model.arch.supports_guidance_scale
+        for widget in self._cfg_widgets:
+            widget.setVisible(supports_guidance)
+        with SignalBlocker(self._steps_slider), SignalBlocker(self._steps_spin):
+            self._steps_slider.setValue(steps)
+            self._steps_spin.setValue(steps)
+        if not supports_guidance:
+            return
+        with SignalBlocker(self._cfg_slider), SignalBlocker(self._cfg_spin):
+            self._cfg_slider.setValue(round(cfg * 10))
+            self._cfg_spin.setValue(cfg)
+
+    def _steps_slider_moved(self, value: int):
+        with SignalBlocker(self._steps_spin):
+            self._steps_spin.setValue(value)
+        self._write_steps(value)
+
+    def _cfg_slider_moved(self, value: int):
+        cfg = value / 10.0
+        with SignalBlocker(self._cfg_spin):
+            self._cfg_spin.setValue(cfg)
+        self._write_cfg(cfg)
+
+    def _steps_committed(self):
+        value = self._steps_spin.value()
+        with SignalBlocker(self._steps_slider):
+            self._steps_slider.setValue(value)
+        self._write_steps(value)
+
+    def _cfg_committed(self):
+        cfg = self._cfg_spin.value()
+        with SignalBlocker(self._cfg_slider):
+            self._cfg_slider.setValue(round(cfg * 10))
+        self._write_cfg(cfg)
+
+    def _write_steps(self, value: int):
+        if self._model is None:
+            return
+        style = self._model.active_style
+        if self._model.is_live_mode:
+            style.live_sampler_steps = value
+        else:
+            style.sampler_steps = value
+        style.save()
+
+    def _write_cfg(self, value: float):
+        if self._model is None:
+            return
+        if not self._model.arch.supports_guidance_scale:
+            return
+        style = self._model.active_style
+        if self._model.is_live_mode:
+            style.live_cfg_scale = value
+        else:
+            style.cfg_scale = value
+        style.save()
+
+
+class LoraDockerItem(QWidget):
+    """Single compact LoRA row: name label, strength spinbox, on/off toggle."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.setLayout(layout)
+
+        self._enabled = SwitchWidget(self)
+        self._enabled.setChecked(True)
+        self._enabled.setToolTip(_("Enable/disable this LoRA"))
+        self._enabled.toggled.connect(lambda _: self.changed.emit())
+
+        self._name_label = QLabel(self)
+        self._name_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._name_label.setMinimumWidth(40)
+        self._name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._name_label.setToolTip("")
+
+        self._strength = QSpinBox(self)
+        self._strength.setMinimum(-400)
+        self._strength.setMaximum(400)
+        self._strength.setSingleStep(5)
+        self._strength.setValue(100)
+        self._strength.setSuffix("%")
+        self._strength.setFixedWidth(70)
+        self._strength.valueChanged.connect(lambda _: self.changed.emit())
+
+        layout.addWidget(self._enabled)
+        layout.addWidget(self._name_label, 1)
+        layout.addWidget(self._strength)
+
+    def set_lora(self, lora_dict: dict):
+        """Populate from a LoRA dict: {name, strength, enabled}."""
+        display = _lora_display_name(lora_dict)
+        self._name_label.setText(display)
+        tooltip = _lora_tooltip(lora_dict)
+        self.setToolTip(tooltip)
+        self._enabled.setToolTip(tooltip)
+        self._name_label.setToolTip(tooltip)
+        self._strength.setToolTip(tooltip)
+        with SignalBlocker(self._strength):
+            self._strength.setValue(int(lora_dict.get("strength", 1.0) * 100))
+        with SignalBlocker(self._enabled):
+            self._enabled.is_checked = lora_dict.get("enabled", True)
+
+    def to_dict(self, original: dict) -> dict:
+        """Return updated LoRA dict preserving metadata fields."""
+        result = dict(original)
+        result["name"] = original.get("name", "")
+        result["strength"] = self._strength.value() / 100.0
+        result["enabled"] = self._enabled.isChecked()
+        return result
+
+
+class VerticalResizeHandle(QToolButton):
+    drag_started = pyqtSignal(int)
+    drag_moved = pyqtSignal(int)
+    drag_finished = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging = False
+        self.setText("...")
+        self.setAutoRaise(True)
+        self.setFixedHeight(8)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip(_("Drag to resize"))
+
+    def mousePressEvent(self, event: QMouseEvent | None):
+        if event and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self.drag_started.emit(self.mapToGlobal(event.pos()).y())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent | None):
+        if self._dragging and event:
+            self.drag_moved.emit(self.mapToGlobal(event.pos()).y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent | None):
+        if self._dragging:
+            self._dragging = False
+            self.drag_finished.emit()
+            if event:
+                event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+def _lora_display_name(lora: dict | str) -> str:
+    """Extract a short display name from a LoRA file ID."""
+    if isinstance(lora, dict):
+        if display_name := str(lora.get("display_name", "")).strip():
+            return display_name
+        lora_id = str(lora.get("name", ""))
+    else:
+        lora_id = lora
+    name = lora_id.replace("\\", "/")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    if dot > 0:
+        name = name[:dot]
+    return name
+
+
+def _lora_tooltip(lora: dict) -> str:
+    lora_id = str(lora.get("name", ""))
+    display = _lora_display_name(lora)
+    description = str(lora.get("description", "")).strip()
+    lines = [_wrap_tooltip_text(display)]
+    if lora_id and lora_id != display:
+        lines.append(_wrap_tooltip_text(lora_id))
+    if description:
+        lines.extend(["", _wrap_tooltip_text(description)])
+    return "\n".join(lines)
+
+
+def _wrap_tooltip_text(text: str, width=56) -> str:
+    result = []
+    for line in text.splitlines():
+        if line.strip():
+            result.append(fill(line, width=width))
+        else:
+            result.append("")
+    return "\n".join(result)
+
+
+class LoraDockerPanel(QWidget):
+    """Compact LoRA panel for the main docker showing active style's LoRAs."""
+
+    _model: Model | None = None
+    _lora_items: list[LoraDockerItem]
+    _columns = 2
+    _item_height = 26
+    _min_visible_rows = 1
+    _max_visible_rows = 50
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lora_items = []
+        self._updating = False
+        self._visible_rows = self._clamp_visible_rows(settings.lora_docker_visible_rows)
+        self._resize_start_y = 0
+        self._resize_start_rows = self._visible_rows
+
+        self._layout = QVBoxLayout()
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self.setLayout(self._layout)
+
+        header = QLabel("<b>" + _("LoRAs") + "</b>", self)
+        self._layout.addWidget(header)
+
+        # Scrollable container for LoRA items
+        self._scroll_area = QScrollArea(self)
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll_area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+        self._scroll_content = QWidget()
+        self._item_container = QGridLayout(self._scroll_content)
+        self._item_container.setContentsMargins(0, 0, 0, 0)
+        self._item_container.setSpacing(1)
+        self._scroll_area.setWidget(self._scroll_content)
+        self._layout.addWidget(self._scroll_area)
+
+        self._resize_handle = VerticalResizeHandle(self)
+        self._resize_handle.drag_started.connect(self._start_resize)
+        self._resize_handle.drag_moved.connect(self._resize_to)
+        self._resize_handle.drag_finished.connect(self._finish_resize)
+        self._layout.addWidget(self._resize_handle)
+
+        self._empty_label = QLabel(
+            "<i>" + _("No LoRAs in active style") + "</i>", self
+        )
+        self._empty_label.setStyleSheet(f"color: {theme.grey};")
+        self._layout.addWidget(self._empty_label)
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        if self._model is not None:
+            self._model.effective_style_changed.disconnect(self._rebuild)
+        self._model = model
+        model.effective_style_changed.connect(self._rebuild)
+        self._rebuild()
+
+    def _rebuild(self):
+        """Rebuild the LoRA item list from the active style."""
+        if self._model is None or self._updating:
+            return
+        style = self._model.active_style
+        loras = style.loras
+
+        # Hide all existing items first
+        for item in self._lora_items:
+            item.setVisible(False)
+
+        # Show or create items for each LoRA
+        for i, lora_dict in enumerate(loras):
+            if i < len(self._lora_items):
+                item = self._lora_items[i]
+            else:
+                item = LoraDockerItem(self)
+                item.changed.connect(self._write_back)
+                self._lora_items.append(item)
+            row = i // self._columns
+            column = i % self._columns
+            self._item_container.addWidget(item, row, column)
+            item.set_lora(lora_dict)
+            item.setVisible(True)
+
+        has_loras = len(loras) > 0
+        self._empty_label.setVisible(not has_loras)
+        self._scroll_area.setVisible(has_loras)
+        self._resize_handle.setVisible(has_loras)
+
+        if has_loras:
+            self._update_scroll_height(len(loras))
+
+    def _clamp_visible_rows(self, rows: int):
+        return max(self._min_visible_rows, min(self._max_visible_rows, rows))
+
+    def _update_scroll_height(self, lora_count: int | None = None):
+        if lora_count is None and self._model is not None:
+            lora_count = len(self._model.active_style.loras)
+        if not lora_count:
+            return
+        row_count = (lora_count + self._columns - 1) // self._columns
+        visible_count = min(row_count, self._visible_rows)
+        self._scroll_area.setFixedHeight(self._item_height * visible_count + 4)
+        self._scroll_content.setMinimumHeight(self._item_height * row_count)
+
+    def _start_resize(self, global_y: int):
+        self._resize_start_y = global_y
+        self._resize_start_rows = self._visible_rows
+
+    def _resize_to(self, global_y: int):
+        row_delta = round((global_y - self._resize_start_y) / self._item_height)
+        self._visible_rows = self._clamp_visible_rows(self._resize_start_rows + row_delta)
+        self._update_scroll_height()
+
+    def _finish_resize(self):
+        if settings.lora_docker_visible_rows != self._visible_rows:
+            settings.lora_docker_visible_rows = self._visible_rows
+            settings.save()
+
+    def _write_back(self):
+        """Write modified strength/enabled values back to the style."""
+        if self._model is None:
+            return
+        self._updating = True
+        try:
+            style = self._model.active_style
+            new_loras = []
+            for i, original in enumerate(style.loras):
+                if i < len(self._lora_items) and self._lora_items[i].isVisible():
+                    new_loras.append(self._lora_items[i].to_dict(original))
+                else:
+                    new_loras.append(original)
+            style.loras = new_loras
+            style.save()
+        finally:
+            self._updating = False
+
+
+class QuickStyleBar(QWidget):
+    """Row of one-click generate buttons, one per configured quick style."""
+
+    _model: Model | None = None
+    _buttons: list[QPushButton]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._buttons = []
+
+        self._layout = QHBoxLayout()
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self.setLayout(self._layout)
+
+        self._configure_button = QToolButton(self)
+        self._configure_button.setText("⚙")
+        self._configure_button.setToolTip(_("Configure quick generate styles"))
+        self._configure_button.setFixedSize(QSize(22, 22))
+        self._configure_button.clicked.connect(self._open_config_menu)
+        self._layout.addWidget(self._configure_button)
+
+        self._scroll_area = QScrollArea(self)
+        self._scroll_area.setWidgetResizable(False)
+        self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._scroll_area.setFixedHeight(28)
+
+        self._button_content = QWidget()
+        self._button_layout = QHBoxLayout(self._button_content)
+        self._button_layout.setContentsMargins(0, 0, 0, 0)
+        self._button_layout.setSpacing(2)
+        self._scroll_area.setWidget(self._button_content)
+        self._layout.addWidget(self._scroll_area, 1)
+
+        settings.changed.connect(self._handle_settings_changed)
+        Styles.list().changed.connect(self._rebuild)
+        Styles.list().name_changed.connect(self._rebuild)
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        self._model = model
+        self._rebuild()
+
+    def _handle_settings_changed(self, name: str, _value: object):
+        if name == "quick_styles":
+            self._rebuild()
+
+    def _rebuild(self, *args):
+        """Rebuild buttons from the quick_styles setting."""
+        # Remove old buttons
+        for btn in self._buttons:
+            self._button_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._buttons.clear()
+
+        styles_list = Styles.list()
+        for filename in settings.quick_styles:
+            style = styles_list.find(filename)
+            if style is None:
+                continue
+            btn = QPushButton(style.name, self._button_content)
+            btn.setToolTip(_("Generate with") + f" {style.name}")
+            btn.setMaximumHeight(22)
+            btn.setMinimumWidth(btn.sizeHint().width())
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(lambda checked=False, s=style: self._generate(s))
+            self._button_layout.addWidget(btn)
+            self._buttons.append(btn)
+        self._resize_button_content()
+
+    def _resize_button_content(self):
+        if not hasattr(self, "_button_layout"):
+            return
+        margins = self._button_layout.contentsMargins()
+        spacing = self._button_layout.spacing()
+        button_width = sum(button.sizeHint().width() for button in self._buttons)
+        button_height = max((button.sizeHint().height() for button in self._buttons), default=22)
+        desired_width = (
+            margins.left()
+            + margins.right()
+            + button_width
+            + spacing * max(0, len(self._buttons) - 1)
+        )
+        viewport_width = max(1, self._scroll_area.viewport().width())
+        needs_scroll = desired_width > viewport_width
+        scroll_height = self._scroll_area.horizontalScrollBar().sizeHint().height()
+        content_height = max(button_height, 22)
+        area_height = content_height + (scroll_height if needs_scroll else 0) + 2
+        content_width = max(viewport_width, desired_width)
+        self._scroll_area.setFixedHeight(area_height)
+        self._button_content.setFixedSize(content_width, content_height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_button_content()
+
+    def _generate(self, style: Style):
+        if self._model is not None:
+            self._model.generate_with_style(style)
+
+    def _open_config_menu(self):
+        menu = QMenu(self)
+        styles_list = Styles.list()
+        current = set(settings.quick_styles)
+
+        for style in styles_list.filtered():
+            action = QAction(style.name, menu)
+            action.setCheckable(True)
+            action.setChecked(style.filename in current)
+            action.toggled.connect(lambda checked, fn=style.filename: self._toggle_style(fn, checked))
+            menu.addAction(action)
+
+        menu.exec_(self._configure_button.mapToGlobal(
+            QPoint(0, self._configure_button.height())
+        ))
+
+    def _toggle_style(self, filename: str, checked: bool):
+        current = list(settings.quick_styles)
+        if checked and filename not in current:
+            current.append(filename)
+        elif not checked and filename in current:
+            current.remove(filename)
+        settings.quick_styles = current
+        settings.save()
+
+
+class VramWidget(QWidget):
+    """Compact VRAM usage indicator with a Free VRAM button."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.setLayout(layout)
+
+        self._label = QLabel(_("VRAM") + ": --", self)
+        self._label.setStyleSheet(f"color: {theme.grey}; font-size: 11px;")
+
+        self._free_button = QPushButton(_("Free VRAM"), self)
+        self._free_button.setMaximumHeight(20)
+        self._free_button.setToolTip(_("Unload all models and free GPU memory"))
+        self._free_button.clicked.connect(self._free_memory)
+
+        layout.addWidget(self._label, 1)
+        layout.addWidget(self._free_button)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_stats)
+        self._poll_timer.start(5000)  # poll every 5 seconds
+
+        root.connection.state_changed.connect(self._on_connection_changed)
+
+    def _on_connection_changed(self):
+        if root.connection.client_if_connected:
+            self._poll_stats()
+
+    def _poll_stats(self):
+        client = root.connection.client_if_connected
+        if client is None:
+            self._label.setText(_("VRAM") + ": --")
+            return
+        eventloop.run(self._fetch_stats(client))
+
+    async def _fetch_stats(self, client):
+        try:
+            data = await client.get_system_stats()
+            devices = data.get("devices", [])
+            if devices:
+                dev = devices[0]
+                total = dev.get("vram_total", 0)
+                free = dev.get("vram_free", 0)
+                used = total - free
+                total_gb = total / (1024**3)
+                used_gb = used / (1024**3)
+                self._label.setText(
+                    _("VRAM") + f": {used_gb:.1f} / {total_gb:.1f} GB"
+                )
+        except Exception:
+            self._label.setText(_("VRAM") + ": --")
+
+    def _free_memory(self):
+        client = root.connection.client_if_connected
+        if client is None:
+            return
+        eventloop.run(self._do_free(client))
+
+    async def _do_free(self, client):
+        try:
+            await client.free_memory()
+            # Refresh stats after freeing
+            await self._fetch_stats(client)
+        except Exception:
+            pass
 
 
 class LayerCountWidget(QWidget):

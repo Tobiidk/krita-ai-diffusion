@@ -351,9 +351,9 @@ class ComfyWorkflow:
         self.sample_count += steps - start_at_step
 
         if arch.is_flux_like:
-            positive = self.flux_guidance(cond.positive, cfg if cfg > 1 else 3.5)
+            positive = self.flux_guidance(cond.positive, cfg)
             guider = self.basic_guider(model, positive)
-        elif cfg == 1.0:
+        elif cfg == 1.0 or not arch.supports_cfg:
             guider = self.basic_guider(model, cond.positive)
         else:
             guider = self.cfg_guider(model, cond, cfg)
@@ -1070,6 +1070,18 @@ class ComfyWorkflow:
             reference=reference,
             exclude_mask=exclude_mask,
             strength=strength,
+        )
+
+    def image_blend(self, image1: Output, image2: Output, strength=0.5, mode="normal"):
+        if strength <= 0.0:
+            return image1
+        return self.add(
+            "ImageBlend",
+            1,
+            image1=image1,
+            image2=image2,
+            blend_factor=strength,
+            blend_mode=mode,
         )
 
     def crop_mask(self, mask: Output, bounds: Bounds):

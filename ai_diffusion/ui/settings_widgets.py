@@ -63,6 +63,28 @@ class WarningIcon(QLabel):
         self.setVisible(False)
 
 
+class NoWheelComboBox(QComboBox):
+    """Combo box that does not change value from page scrolling while hovered."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_open = False
+
+    def showPopup(self):
+        self._popup_open = True
+        super().showPopup()
+
+    def hidePopup(self):
+        self._popup_open = False
+        super().hidePopup()
+
+    def wheelEvent(self, event):
+        if self._popup_open:
+            super().wheelEvent(event)
+        elif event is not None:
+            event.ignore()
+
+
 class SettingWidget(QWidget):
     value_changed = pyqtSignal()
 
@@ -292,7 +314,7 @@ class ComboBoxSetting(SettingWidget):
 
     def __init__(self, setting: Setting, model: QAbstractItemModel | None = None, parent=None):
         super().__init__(setting, parent)
-        self._combo = QComboBox(self)
+        self._combo = NoWheelComboBox(self)
         if model is not None:
             self._combo.setModel(model)
         elif setting.items:

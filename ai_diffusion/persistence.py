@@ -155,6 +155,7 @@ class ModelSync:
         state["root"] = _serialize(model.regions)
         state["edit"] = _serialize(model.edit_regions)
         state["control"] = [_serialize(c) for c in model.regions.control]
+        state["edit_control"] = [_serialize(c) for c in model.edit_regions.control]
         state["regions"] = []
         for region in model.regions:
             state["regions"].append(_serialize(region))
@@ -176,6 +177,8 @@ class ModelSync:
         _deserialize(model.edit_regions, state.get("edit", {}))
         for control_state in state.get("control", []):
             _deserialize(model.regions.control.emplace(), control_state)
+        for control_state in state.get("edit_control", []):
+            _deserialize(model.edit_regions.control.emplace(), control_state)
         for region_state in state.get("regions", []):
             region = model.regions.emplace()
             _deserialize(region, region_state)

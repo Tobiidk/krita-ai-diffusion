@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from ai_diffusion.comfy_workflow import ComfyObjectInfo, ComfyWorkflow
+from ai_diffusion.comfy_workflow import ComfyObjectInfo, ComfyWorkflow, ConditioningOutput
+from ai_diffusion.resources import Arch
 
 
 @pytest.fixture(scope="module")
@@ -112,3 +113,32 @@ def test_defaults_legacy_combo(info: ComfyObjectInfo):
     assert inputs["images"] == "img"
     assert inputs["format"] == "PNG"
     assert set(inputs.keys()) == {"images", "format"}
+
+
+@pytest.mark.parametrize("cfg", [1.0, 3.5, 20.0])
+def test_flux2_klein_ignores_guidance_scale(cfg: float):
+    w = ComfyWorkflow()
+    model = w.add("TestModel", output_count=1)
+    positive = w.add("TestPositiveConditioning", output_count=1)
+    negative = w.add("TestNegativeConditioning", output_count=1)
+    latent = w.add("TestLatent", output_count=1)
+
+    w.sampler_custom_advanced(
+        model,
+        ConditioningOutput(positive, negative),
+        latent,
+        Arch.flux2_4b,
+        sampler="euler",
+        scheduler="flux2",
+        steps=5,
+        cfg=cfg,
+        seed=1234,
+    )
+
+    node_types = [node["class_type"] for node in w.root.values()]
+    assert "BasicGuider" in node_types
+    assert "FluxGuidance" not in node_types
+    assert "CFGGuider" not in node_types
+
+    basic_guider = next(node for node in w.root.values() if node["class_type"] == "BasicGuider")
+    assert basic_guider["inputs"]["conditioning"] == [str(positive.node), positive.output]

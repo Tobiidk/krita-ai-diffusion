@@ -1,6 +1,7 @@
 from PyQt5.QtCore import QEvent, QMetaObject, Qt, pyqtSignal
 from PyQt5.QtGui import QCursor
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QGroupBox,
@@ -133,6 +134,23 @@ class UpscaleWidget(QWidget):
         self.factor_widget.value_changed.connect(self._update_factor)
         layout.addWidget(self.factor_widget)
 
+        self.noise_checkbox = QCheckBox(_("Inject Noise"), self)
+        self.noise_checkbox.setToolTip(
+            _("Add random noise before upscaling to reduce blurriness with some models")
+        )
+        layout.addWidget(self.noise_checkbox)
+
+        self.noise_slider = StrengthWidget(
+            slider_range=(1, 30), prefix=False, parent=self
+        )
+        noise_layout = QHBoxLayout()
+        noise_layout.addWidget(QLabel(_("Noise Strength"), self), 1)
+        noise_layout.addWidget(self.noise_slider, 3)
+        self._noise_layout_widget = QWidget(self)
+        self._noise_layout_widget.setLayout(noise_layout)
+        self._noise_layout_widget.setVisible(False)
+        layout.addWidget(self._noise_layout_widget)
+
         self.refinement_checkbox = QGroupBox(_("Refine upscaled image"), self)
         self.refinement_checkbox.setCheckable(True)
 
@@ -222,6 +240,8 @@ class UpscaleWidget(QWidget):
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
                 bind_combo(model.upscale, "upscaler", self.model_select),
                 bind(model.upscale, "factor", self.factor_widget, "value"),
+                bind_toggle(model.upscale, "inject_noise", self.noise_checkbox),
+                bind(model.upscale, "noise_strength", self.noise_slider, "value"),
                 bind_toggle(model.upscale, "use_diffusion", self.refinement_checkbox),
                 bind(model, "style", self.style_select, "value"),
                 bind(model.upscale, "strength", self.strength_slider, "value"),
@@ -241,6 +261,8 @@ class UpscaleWidget(QWidget):
             ]
             self.upscale_button.model = model
             self.queue_button.model = model
+            self.noise_checkbox.toggled.connect(self._noise_layout_widget.setVisible)
+            self._noise_layout_widget.setVisible(model.upscale.inject_noise)
             self._update_prompt()
             self._update_style()
             self._update_overlap()

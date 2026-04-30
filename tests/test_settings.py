@@ -155,6 +155,7 @@ def test_duplicate_style(tmp_path_factory):
     styles = Styles(tmp_path_factory.mktemp("builtin"), tmp_path_factory.mktemp("user"))
     original = styles.create("original.json")
     original.loras.append({"name": "lora", "strength": 1.0})
+    original.text_encoders = {"qwen_3_4b": "encoder.safetensors"}
     original.name = "Original"
     original.live_sampler_steps = 42
 
@@ -162,10 +163,13 @@ def test_duplicate_style(tmp_path_factory):
     assert copy.filename == "original-1.json"
     assert copy.name == "Original (Copy)"
     assert copy.loras == original.loras
+    assert copy.text_encoders == original.text_encoders
     assert copy.live_sampler_steps == original.live_sampler_steps
 
     copy.loras[0] = {"name": "lora2", "strength": 2.0}
+    copy.text_encoders["qwen_3_4b"] = "other.safetensors"
     assert copy.loras != original.loras
+    assert copy.text_encoders != original.text_encoders
 
 
 def test_sampler_presets(tmp_path_factory):

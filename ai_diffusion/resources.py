@@ -191,7 +191,11 @@ class Arch(Enum):
 
     @property
     def supports_cfg(self):
-        return self not in [Arch.flux, Arch.flux_k]
+        return not (self.is_flux_like or self.is_flux2)
+
+    @property
+    def supports_guidance_scale(self):
+        return self.supports_cfg or self.is_flux_like
 
     @property
     def is_edit(self):  # edit models make changes to input images
@@ -298,6 +302,8 @@ class ControlMode(Enum):
     face = 13
     inpaint = 1
     universal = 16
+    color_match = 17
+    light_map = 18
     scribble = 2
     line_art = 3
     soft_edge = 4
@@ -329,8 +335,15 @@ class ControlMode(Enum):
         ]
 
     @property
+    def is_post_processing(self):
+        return self in [
+            ControlMode.color_match,
+            ControlMode.light_map,
+        ]
+
+    @property
     def is_control_net(self):
-        return not self.is_ip_adapter
+        return not (self.is_ip_adapter or self.is_post_processing)
 
     @property
     def is_ip_adapter(self):
@@ -350,8 +363,12 @@ class ControlMode(Enum):
         return self in [ControlMode.reference, ControlMode.line_art, ControlMode.blur]
 
     @property
+    def has_timestep_range(self):
+        return not self.is_post_processing
+
+    @property
     def is_structural(self):  # strong impact on image composition/structure
-        return not (self.is_ip_adapter or self is ControlMode.inpaint)
+        return not (self.is_ip_adapter or self.is_post_processing or self is ControlMode.inpaint)
 
     @property
     def text(self):

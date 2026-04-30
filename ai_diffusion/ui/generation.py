@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from html import escape
 from textwrap import wrap as wrap_text
 from typing import ClassVar, cast
 
@@ -9,6 +9,7 @@ from PyQt5.QtCore import (
     QItemSelectionModel,
     QMetaObject,
     QPoint,
+    QRect,
     QSize,
     Qt,
     QTimer,
@@ -23,12 +24,15 @@ from PyQt5.QtGui import (
     QKeySequence,
     QMouseEvent,
     QPalette,
+    QPainter,
 )
 from PyQt5.QtWidgets import (
     QAction,
     QCheckBox,
     QComboBox,
+    QDialog,
     QHBoxLayout,
+    QLabel,
     QListView,
     QListWidget,
     QListWidgetItem,
@@ -37,6 +41,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -53,24 +58,96 @@ from ..settings import settings
 from ..style import Styles
 from ..util import ensure, flatten, sequence_equal
 from ..workflow import FillMode, InpaintMode
-from . import theme
+from . import actions, theme
 from .region import RegionPromptWidget
 from .widget import (
     ErrorBox,
     GenerateButton,
     LayerCountWidget,
+    LoraDockerPanel,
+    QuickStyleBar,
     QueueButton,
     StrengthWidget,
+    StyleParamsWidget,
     StyleSelectWidget,
+    VramWidget,
     WorkspaceSelectWidget,
     create_wide_tool_button,
 )
 
 
+class ImageCompareLabel(QLabel):
+    def __init__(self, left: Image, right: Image, parent=None):
+        super().__init__(parent)
+        self._left = left
+        self._right = right
+        self._position = 50
+        self.setMinimumSize(420, 320)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_position(self, value: int):
+        self._position = value
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent | None):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().base())
+
+        target = self._target_rect()
+        if target.isEmpty():
+            return
+
+        right = self._right.to_pixmap().scaled(
+            target.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        left = self._left.to_pixmap().scaled(
+            target.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        image_rect = QRect(
+            target.x() + (target.width() - right.width()) // 2,
+            target.y() + (target.height() - right.height()) // 2,
+            right.width(),
+            right.height(),
+        )
+
+        painter.drawPixmap(image_rect, right)
+        split = image_rect.x() + round(image_rect.width() * self._position / 100)
+        painter.save()
+        painter.setClipRect(
+            QRect(image_rect.x(), image_rect.y(), split - image_rect.x(), image_rect.height())
+        )
+        painter.drawPixmap(image_rect, left)
+        painter.restore()
+        painter.setPen(QColor("#ffd43b"))
+        painter.drawLine(split, image_rect.y(), split, image_rect.bottom())
+
+    def _target_rect(self):
+        return self.rect().adjusted(6, 6, -6, -6)
+
+
+class ImageCompareDialog(QDialog):
+    def __init__(self, left: Image, right: Image, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Compare Images"))
+        layout = QVBoxLayout(self)
+        self._label = ImageCompareLabel(left, right, self)
+        self._slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(50)
+        self._slider.valueChanged.connect(self._label.set_position)
+        layout.addWidget(self._label)
+        layout.addWidget(self._slider)
+
+
 class HistoryWidget(QListWidget):
     _model: Model
     _connections: list[QMetaObject.Connection]
-    _last_job_params: JobParams | None = None
+    _settings_connection: QMetaObject.Connection
+    _last_group_key: tuple | None = None
 
     item_activated = pyqtSignal(QListWidgetItem)
 
@@ -128,6 +205,7 @@ class HistoryWidget(QListWidget):
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
+        self._settings_connection = settings.changed.connect(self._handle_settings_changed)
 
     @property
     def model_(self):
@@ -148,15 +226,16 @@ class HistoryWidget(QListWidget):
         self.rebuild()
         self.update_selection()
 
-    def add(self, job: Job):
+    def add(self, job: Job, is_new: bool = True):
         if not self.is_finished(job):
             return  # Only finished diffusion/animation jobs have images to show
 
         scrollbar = self.verticalScrollBar()
         scroll_to_bottom = scrollbar and scrollbar.value() >= scrollbar.maximum() - 4
 
-        if not JobParams.equal_ignore_seed(self._last_job_params, job.params):
-            self._last_job_params = job.params
+        group_key = self._history_group_key(job.params)
+        if self._last_group_key != group_key:
+            self._last_group_key = group_key
             prompt = job.params.name if job.params.name != "" else "<no prompt>"
             strength = job.params.metadata.get("strength", 1.0)
             strength = f"{strength * 100:.0f}% - " if strength != 1.0 else ""
@@ -171,78 +250,253 @@ class HistoryWidget(QListWidget):
 
         if job.kind is JobKind.diffusion:
             if job.params.is_layered:
-                self._add_item(job, QListWidgetItem(self._image_thumbnail(job, 0), None))
+                self._add_item(job, QListWidgetItem(self._image_thumbnail(job, 0, is_new), None))
             else:
                 for i, img in enumerate(job.results):
-                    self._add_item(job, QListWidgetItem(self._image_thumbnail(job, i), None), i)
+                    self._add_item(
+                        job,
+                        QListWidgetItem(self._image_thumbnail(job, i, is_new), None),
+                        i,
+                        is_new,
+                    )
 
         if job.kind is JobKind.animation:
             item = AnimatedListItem([
-                self._image_thumbnail(job, i) for i in range(len(job.results))
+                self._image_thumbnail(job, i, is_new) for i in range(len(job.results))
             ])
-            self._add_item(job, item)
+            self._add_item(job, item, is_new=is_new)
 
         if scroll_to_bottom:
             self.scrollToBottom()
 
-    def _add_item(self, job: Job, item: QListWidgetItem, index=0):
+    def _add_item(self, job: Job, item: QListWidgetItem, index=0, is_new: bool = True):
         item.setData(Qt.ItemDataRole.UserRole, job.id)
         item.setData(Qt.ItemDataRole.UserRole + 1, index)
-        item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info(job.params))
+        item.setData(Qt.ItemDataRole.UserRole + 2, is_new)
+        item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info_html(job.params))
         self.addItem(item)
+
+    def _history_group_key(self, params: JobParams):
+        meta = params.metadata
+        return (
+            meta.get("prompt_final") or meta.get("prompt_eval") or meta.get("prompt") or params.name,
+            meta.get("negative_prompt_final")
+            or meta.get("negative_prompt_eval")
+            or meta.get("negative_prompt", ""),
+            meta.get("style", ""),
+            meta.get("checkpoint", ""),
+            repr(meta.get("loras", [])),
+            repr(meta.get("control", [])),
+        )
 
     _job_info_translations: ClassVar[dict[str, str]] = {
         "prompt": _("Prompt"),
         "prompt_eval": _("Prompt (Evaluated)"),
+        "prompt_final": _("Prompt (Final)"),
         "negative_prompt": _("Negative Prompt"),
         "negative_prompt_eval": _("Negative Prompt (Evaluated)"),
+        "negative_prompt_final": _("Negative Prompt (Final)"),
         "style": _("Style"),
         "strength": _("Strength"),
+        "denoise": _("Denoise"),
         "checkpoint": _("Model"),
         "loras": _("LoRA"),
         "sampler": _("Sampler"),
         "seed": _("Seed"),
         "steps": _("Sampler Steps"),
+        "actual_steps": _("Actual Steps"),
+        "total_steps": _("Total Steps"),
         "guidance": _("Guidance Strength (CFG Scale)"),
         "control": _("Control Layers"),
+        "text_encoders": _("Text Encoders"),
     }
+    _prompt_section_settings: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        ("history_show_prompt", "prompt", "negative_prompt"),
+        ("history_show_prompt_evaluated", "prompt_eval", "negative_prompt_eval"),
+        ("history_show_prompt_final", "prompt_final", "negative_prompt_final"),
+    )
 
-    def _job_info(self, params: JobParams):
+    def _job_title(self, params: JobParams):
         title = params.name if params.name != "" else "<no prompt>"
         if len(title) > 70:
             title = title[:66] + "..."
         if params.strength != 1.0:
             title = f"{title} @ {params.strength * 100:.0f}%"
+        return title
+
+    def _style_name(self, params: JobParams):
         style = Styles.list().find(params.style)
-        strings: list[str | list[str]] = [
-            title + "\n",
-            _("Click to toggle preview, double-click to apply."),
-            "",
+        if style:
+            return f"{style.name} ({style.filename})"
+        return params.style
+
+    def _short_file(self, value: object):
+        text = str(value).replace("\\", "/")
+        return text.rsplit("/", 1)[-1] if "/" in text else text
+
+    def _format_float(self, value: object):
+        if isinstance(value, float):
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    def _format_loras(self, value: object):
+        if not isinstance(value, list):
+            return [str(value)]
+        result = []
+        for lora in value:
+            if not isinstance(lora, dict) or not lora.get("enabled", True):
+                continue
+            weight = lora.get("weight", lora.get("strength", "?"))
+            result.append(f"{self._short_file(lora.get('name', ''))}  {self._format_float(weight)}")
+        return result
+
+    def _format_control(self, value: object):
+        if not isinstance(value, list):
+            return [str(value)]
+        result = []
+        for control in value:
+            if not isinstance(control, dict):
+                continue
+            text = f"{control.get('mode')}: {control.get('image', '')}"
+            text += f"  @{self._format_float(control.get('strength', '?'))}"
+            start = control.get("start")
+            end = control.get("end")
+            if start is not None and end is not None:
+                text += f"  {self._format_float(start)}-{self._format_float(end)}"
+            result.append(text)
+        return result
+
+    def _format_text_encoders(self, value: object):
+        if not isinstance(value, dict):
+            return [str(value)]
+        return [f"{key}: {self._short_file(model)}" for key, model in value.items() if model]
+
+    def _prompt_value(self, params: JobParams, key: str):
+        value = params.metadata.get(key, "")
+        return value if isinstance(value, str) else str(value)
+
+    def _dedup_prompt_sections(self, params: JobParams):
+        enabled = [
+            item for item in self._prompt_section_settings if getattr(settings, item[0])
         ]
-        for key, value in params.metadata.items():
-            if key not in self._job_info_translations:
+        keys = [positive for _, positive, _ in enabled]
+        keys.extend(negative for _, _, negative in enabled)
+        seen: set[str] = set()
+        for key in keys:
+            value = self._prompt_value(params, key).strip()
+            if not value or value in seen:
                 continue
-            if key == "style" and style:
-                value = style.name
-            if isinstance(value, list) and len(value) == 0:
+            seen.add(value)
+            yield self._job_info_translations[key], value
+
+    def _handle_settings_changed(self, key: str, _value: object):
+        if key in {setting for setting, _, _ in self._prompt_section_settings}:
+            self._refresh_tooltips()
+
+    def _refresh_tooltips(self):
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None or item.data(Qt.ItemDataRole.UserRole + 1) is None:
                 continue
-            if key == "loras" and isinstance(value, list) and isinstance(value[0], dict):
-                value = " | ".join(
-                    f"{v.get('name')} ({v.get('weight', v.get('strength', '?'))})"
-                    for v in value
-                    if v.get("enabled", True)
-                )
-            if key == "control" and isinstance(value, list) and isinstance(value[0], dict):
-                control_text = []
-                for v in value:
-                    t = f"{v.get('mode')}: {v.get('image', '')[:30]} @{v.get('strength', '?')}"
-                    control_text.append(t)
-                value = " | ".join(control_text)
-            s = f"{self._job_info_translations.get(key, key)}: {value}"
-            s = wrap_text(s, 80, subsequent_indent=" ")
-            strings.append(s)
-        strings.append(_("Seed") + f": {params.seed}")
+            job_id = item.data(Qt.ItemDataRole.UserRole)
+            if job := self._model.jobs.find(job_id):
+                item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info_html(job.params))
+
+    def _core_info(self, params: JobParams):
+        meta = params.metadata
+        rows = [
+            (_("Style"), self._style_name(params)),
+            (_("Model"), meta.get("checkpoint", "")),
+            (_("Sampler"), meta.get("sampler", "")),
+            (_("Steps"), meta.get("steps", "")),
+            (_("Guidance"), meta.get("guidance", "")),
+        ]
+        if "denoise" in meta:
+            denoise = f"{float(meta['denoise']) * 100:.0f}%"
+            actual = meta.get("actual_steps")
+            total = meta.get("total_steps")
+            if actual and total:
+                denoise += f" ({actual}/{total})"
+            rows.append((_("Denoise"), denoise))
+        elif params.strength != 1.0:
+            rows.append((_("Denoise"), f"{params.strength * 100:.0f}%"))
+        rows.append((_("Seed"), params.seed))
+        return [(label, value) for label, value in rows if value not in ("", None, [])]
+
+    def _wrap_plain(self, value: str, width=92):
+        lines: list[str] = []
+        for paragraph in value.splitlines() or [""]:
+            lines.extend(wrap_text(paragraph, width=width) or [""])
+        return lines
+
+    def _wrap_html(self, value: str, width=92):
+        return "<br/>".join(escape(line) for line in self._wrap_plain(value, width))
+
+    def _job_info_plain(self, params: JobParams, include_usage=True):
+        strings: list[str] = [self._job_title(params)]
+        if include_usage:
+            strings.extend(["", _("Click to toggle preview, double-click to apply.")])
+        strings.append("")
+
+        for label, value in self._core_info(params):
+            strings.append(f"{label}: {value}")
+
+        for key, formatter in [
+            ("loras", self._format_loras),
+            ("control", self._format_control),
+            ("text_encoders", self._format_text_encoders),
+        ]:
+            lines = formatter(params.metadata.get(key, []))
+            if lines:
+                strings.append("")
+                strings.append(self._job_info_translations[key] + ":")
+                strings.extend(f"  {line}" for line in lines)
+
+        for label, value in self._dedup_prompt_sections(params):
+            strings.append("")
+            strings.append(label + ":")
+            strings.extend(f"  {line}" for line in self._wrap_plain(value))
+
         return "\n".join(flatten(strings))
+
+    def _job_info_html(self, params: JobParams):
+        title = escape(self._job_title(params))
+        usage = escape(_("Click to toggle preview, double-click to apply."))
+        parts = [
+            "<qt><div style='width: 560px;'>",
+            f"<b>{title}</b><br/>",
+            f"<span style='color: {theme.grey};'>{usage}</span>",
+            "<hr/>",
+            "<table cellspacing='2' cellpadding='0'>",
+        ]
+        for label, value in self._core_info(params):
+            parts.append(
+                "<tr>"
+                f"<td><b>{escape(str(label))}</b></td>"
+                f"<td>{escape(str(value))}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
+
+        for key, formatter in [
+            ("loras", self._format_loras),
+            ("control", self._format_control),
+            ("text_encoders", self._format_text_encoders),
+        ]:
+            lines = formatter(params.metadata.get(key, []))
+            if lines:
+                label = escape(self._job_info_translations[key])
+                body = "<br/>".join(escape(line) for line in lines)
+                parts.append(f"<p><b>{label}</b><br/>{body}</p>")
+
+        for label, value in self._dedup_prompt_sections(params):
+            parts.append(
+                f"<p><b>{escape(label)}</b><br/>"
+                f"<span style='font-family: monospace;'>{self._wrap_html(value)}</span></p>"
+            )
+
+        parts.append("</div></qt>")
+        return "".join(parts)
 
     def remove(self, job: Job):
         self._remove_items(ensure(job.id))
@@ -335,9 +589,11 @@ class HistoryWidget(QListWidget):
     def update_image_thumbnail(self, id: JobQueue.Item):
         if item := self._find(id):
             job = ensure(self._model.jobs.find(id.job))
-            item.setIcon(self._image_thumbnail(job, id.image))
+            item.setIcon(self._image_thumbnail(job, id.image, self._is_new(item)))
 
     def select_item(self):
+        for item in self.selectedItems():
+            self._clear_new_flag(item)
         self._model.jobs.selection = [self._item_data(i) for i in self.selectedItems()]
 
     def _toggle_selection(self):
@@ -353,8 +609,9 @@ class HistoryWidget(QListWidget):
 
     def rebuild(self):
         self.clear()
+        self._last_group_key = None
         for job in filter(self.is_finished, self._model.jobs):
-            self.add(job)
+            self.add(job, is_new=False)
         self.scrollToBottom()
 
     def item_info(self, item: QListWidgetItem) -> tuple[str, int]:  # job id, image index
@@ -413,7 +670,18 @@ class HistoryWidget(QListWidget):
             item.data(Qt.ItemDataRole.UserRole), item.data(Qt.ItemDataRole.UserRole + 1)
         )
 
-    def _image_thumbnail(self, job: Job, index: int):
+    def _is_new(self, item: QListWidgetItem):
+        return bool(item.data(Qt.ItemDataRole.UserRole + 2))
+
+    def _clear_new_flag(self, item: QListWidgetItem):
+        if not self._is_new(item):
+            return
+        item.setData(Qt.ItemDataRole.UserRole + 2, False)
+        job_id, index = self.item_info(item)
+        if job := self._model.jobs.find(job_id):
+            item.setIcon(self._image_thumbnail(job, index, False))
+
+    def _image_thumbnail(self, job: Job, index: int, is_new: bool = False):
         image = job.results[index]
         # Use 2x thumb size for good quality on high-DPI screens
         thumb = Image.scale_to_fit(image, Extent(self._thumb_size * 2, self._thumb_size * 2))
@@ -422,7 +690,29 @@ class HistoryWidget(QListWidget):
             thumb = Image.crop(thumb, Bounds(0, 0, thumb.extent.width, min_height))
         if job.result_was_used(index):  # add tiny star icon to mark used results
             thumb.draw_image(self._applied_icon, offset=(thumb.extent.width - 28, 4))
-        return thumb.to_icon()
+        pixmap = thumb.to_pixmap()
+        if is_new:
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            text = _("NEW")
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            padding = 5
+            rect = QRect(
+                4,
+                4,
+                metrics.horizontalAdvance(text) + padding * 2,
+                metrics.height() + 4,
+            )
+            painter.setPen(QColor(20, 20, 20, 220))
+            painter.setBrush(QColor("#ffd43b"))
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.setPen(QColor("#111111"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.end()
+        return QIcon(pixmap)
 
     def _show_context_menu(self, pos: QPoint):
         item = self.itemAt(pos)
@@ -438,6 +728,8 @@ class HistoryWidget(QListWidget):
             menu.addAction(_("Copy Seed"), self._copy_seed)
             menu.addAction(_("Info to Clipboard"), self._info_to_clipboard)
             menu.addSeparator()
+            compare_action = ensure(menu.addAction(_("Compare Selected"), self._compare_selected))
+            compare_action.setEnabled(len(self._selected_images()) == 2)
             save_action = ensure(menu.addAction(_("Save Image"), self._save_image))
             if self._model.document.filename == "":
                 tt = _(
@@ -492,12 +784,22 @@ class HistoryWidget(QListWidget):
 
     def _info_to_clipboard(self):
         if (job := self.selected_job) and (clipboard := QGuiApplication.clipboard()):
-            style = Styles.list().find(job.params.style)
-            data = job.params.metadata.copy()
-            if style:
-                data["style"] = f"{style.name} ({style.filename})"
-            text = json.dumps(data, indent=2)
-            clipboard.setText(text)
+            clipboard.setText(self._job_info_plain(job.params, include_usage=False))
+
+    def _selected_images(self):
+        images = []
+        for item in self.selectedItems():
+            data = self._item_data(item)
+            if job := self._model.jobs.find(data.job):
+                if isinstance(data.image, int) and 0 <= data.image < len(job.results):
+                    images.append(job.results[data.image])
+        return images
+
+    def _compare_selected(self):
+        images = self._selected_images()
+        if len(images) == 2:
+            dialog = ImageCompareDialog(images[0], images[1], self)
+            dialog.exec()
 
     def _save_image(self):
         items = self.selectedItems()
@@ -536,6 +838,7 @@ class HistoryWidget(QListWidget):
         if reply == QMessageBox.Yes:
             self._model.jobs.clear()
             self.clear()
+            self._last_group_key = None
             self._model.hide_preview(delete_layer=True)
 
 
@@ -692,16 +995,29 @@ class CustomInpaintWidget(QWidget):
             self._model.inpaint.context = data
 
 
-class ProgressBar(QProgressBar):
+class ProgressBar(QWidget):
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self._model = root.active_model
         self._model_bindings: list[QMetaObject.Connection] = []
-        self._palette = self.palette()
-        self.setMinimum(0)
-        self.setMaximum(1000)
-        self.setTextVisible(False)
-        self.setFixedHeight(6)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+        self.setLayout(layout)
+
+        self._bar = QProgressBar(self)
+        self._bar.setMinimum(0)
+        self._bar.setMaximum(1000)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._bar_palette = self._bar.palette()
+        layout.addWidget(self._bar)
+
+        self._detail_label = QLabel(self)
+        self._detail_label.setStyleSheet(f"color: {theme.grey}; font-size: 11px;")
+        self._detail_label.setVisible(False)
+        layout.addWidget(self._detail_label)
 
     @property
     def model(self):
@@ -715,22 +1031,34 @@ class ProgressBar(QProgressBar):
             self._model_bindings = [
                 self._model.progress_changed.connect(self._update_progress),
                 self._model.progress_kind_changed.connect(self._update_progress_kind),
+                self._model.progress_details_changed.connect(self._update_details),
             ]
 
     def _update_progress_kind(self):
-        palette = self._palette
+        palette = self._bar_palette
         if self._model.progress_kind is ProgressKind.upload:
-            palette = self.palette()
+            palette = self._bar.palette()
             palette.setColor(QPalette.ColorRole.Highlight, QColor(theme.progress_alt))
-        self.setPalette(palette)
+        self._bar.setPalette(palette)
 
     def _update_progress(self):
         if self._model.progress >= 0:
-            self.setValue(int(self._model.progress * 1000))
+            self._bar.setValue(int(self._model.progress * 1000))
         else:
-            if self.value() >= 100:
-                self.reset()
-            self.setValue(min(99, self.value() + 2))
+            if self._bar.value() >= 100:
+                self._bar.reset()
+            self._bar.setValue(min(99, self._bar.value() + 2))
+
+    def _update_details(self):
+        details = self._model.progress_details
+        if not details.current_node:
+            self._detail_label.setVisible(False)
+            return
+        text = details.current_node
+        if details.sample_step > 0 and details.sample_max > 0:
+            text += f"  {details.sample_step}/{details.sample_max}"
+        self._detail_label.setText(text)
+        self._detail_label.setVisible(True)
 
 
 class GenerationWidget(QWidget):
@@ -754,7 +1082,10 @@ class GenerationWidget(QWidget):
         self.region_prompt = RegionPromptWidget(self)
         layout.addWidget(self.region_prompt)
 
-        self.strength_slider = StrengthWidget(parent=self)
+        self.strength_slider = StrengthWidget(parent=self, label=_("Denoise"))
+        self.strength_slider.setToolTip(
+            _("How strongly the current image is changed when refining or editing.")
+        )
         self.layer_count_widget = LayerCountWidget(self)
         self.layer_count_widget.setVisible(False)
         self.add_region_button = create_wide_tool_button("region-add", _("Add Region"), self)
@@ -768,8 +1099,17 @@ class GenerationWidget(QWidget):
         strength_layout.addWidget(self.add_region_button)
         layout.addLayout(strength_layout)
 
+        self.style_params = StyleParamsWidget(self)
+        layout.addWidget(self.style_params)
+
+        self.lora_panel = LoraDockerPanel(self)
+        layout.addWidget(self.lora_panel)
+
         self.custom_inpaint = CustomInpaintWidget(self)
         layout.addWidget(self.custom_inpaint)
+
+        self.quick_style_bar = QuickStyleBar(self)
+        layout.addWidget(self.quick_style_bar)
 
         self.generate_button = GenerateButton(JobKind.diffusion, self)
 
@@ -802,13 +1142,23 @@ class GenerationWidget(QWidget):
         self.queue_button = QueueButton(parent=self)
         self.queue_button.setFixedHeight(self.generate_button.height() - 2)
 
+        self.cancel_button = QToolButton(self)
+        self.cancel_button.setIcon(theme.icon("cancel"))
+        self.cancel_button.setToolTip(_("Cancel all active and queued jobs"))
+        self.cancel_button.setFixedHeight(self.generate_button.height() - 2)
+        self.cancel_button.clicked.connect(actions.cancel_all)
+
         actions_layout = QHBoxLayout()
         actions_layout.addLayout(generate_layout)
+        actions_layout.addWidget(self.cancel_button)
         actions_layout.addWidget(self.queue_button)
         layout.addLayout(actions_layout)
 
         self.progress_bar = ProgressBar(self)
         layout.addWidget(self.progress_bar)
+
+        self.vram_widget = VramWidget(self)
+        layout.addWidget(self.vram_widget)
 
         self.error_box = ErrorBox(self)
         layout.addWidget(self.error_box)
@@ -851,6 +1201,9 @@ class GenerationWidget(QWidget):
             ]
             self.region_prompt.regions = model.active_regions
             self.custom_inpaint.model = model
+            self.style_params.model = model
+            self.lora_panel.model = model
+            self.quick_style_bar.model = model
             self.generate_button.model = model
             self.queue_button.model = model
             self.progress_bar.model = model

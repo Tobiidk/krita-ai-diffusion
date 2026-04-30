@@ -1,129 +1,222 @@
-<h1><img width="64px" src="ai_diffusion/icons/logo-128.png"> Generative AI <i>for Krita</i></h1>
+# Krita AI Diffusion - Tobii UI Tweaks Fork
 
-✨[Features](#features) | ⭳ [Download](https://github.com/Acly/krita-ai-diffusion/releases/latest) | 🛠️[Installation](https://docs.interstice.cloud/installation) | 🎞️ [Video](https://youtu.be/Ly6USRwTHe0) | 🖼️[Gallery](#gallery) | 📖[User Guide](https://docs.interstice.cloud) | 💬[Discussion](https://github.com/Acly/krita-ai-diffusion/discussions) | 🗣️[Discord](https://discord.gg/pWyzHfHHhU)
+This fork is a working branch of
+[Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion) focused on
+Flux 2 / Klein workflows, faster sidebar control, clearer history metadata, and
+more practical LoRA handling inside Krita.
 
-This is a plugin to use generative AI in image painting and editing workflows
-from within Krita. Visit
-[**www.interstice.cloud**](https://www.interstice.cloud) for an introduction. Learn how to install and use it on [**docs.interstice.cloud**](https://docs.interstice.cloud).
+The local checkout is intended to be symlinked into Krita's `pykrita` plugin
+folder, so changes in this repo can be tested directly in the installed plugin
+after restarting Krita.
 
-The main goals of this project are:
-* **Precision and Control.** Creating entire images from text can be unpredictable.
-  To get the result you envision, you can restrict generation to selections,
-  refine existing content with a variable degree of strength, focus text on image
-  regions, and guide generation with reference images, sketches, line art,
-  depth maps, and more.
-* **Workflow Integration.** Most image generation tools focus heavily on AI parameters.
-  This project aims to be an unobtrusive tool that integrates and synergizes
-  with image editing workflows in Krita. Draw, paint, edit and generate seamlessly without worrying about resolution and technical details.
-* **Local, Open, Free.** We are committed to open source models. Customize presets, bring your
-  own models, and run everything local on your hardware. Cloud generation is also available
-  to get started quickly without heavy investment.  
+## Current Branch
 
-[![Watch video demo](media/screenshot-video-preview.webp)](https://youtu.be/Ly6USRwTHe0 "Watch video demo")
+- Remote: `https://github.com/Tobiidk/krita-ai-diffusion.git`
+- Branch: `ui-tweaks`
+- Baseline project: Krita plugin using ComfyUI as the backend.
+- Main test target: Flux 2 Klein editing/generation workflows.
 
-## <a name="features"></a> Features
+## Major Fork Changes
 
-* **Inpainting**: Use selections for generative fill, expand, to add or remove objects
-* **Live Painting**: Let AI interpret your canvas in real time for immediate feedback. [Watch Video](https://youtu.be/AF2VyqSApjA?si=Ve5uQJWcNOATtABU)
-* **Upscaling**: Upscale and enrich images to 4k, 8k and beyond without running out of memory.
-* **Diffusion Models**: Flux 2, Z-Image, Stable Diffusion 1.5, XL, Illustrious
-* **Edit Models**: Make modifications to images via text instructions
-* **ControlNet**: Scribble, Line art, Canny edge, Pose, Depth, Normals, Segmentation, +more
-* **IP-Adapter**: Reference images, Style and composition transfer, Face swap
-* **Regions**: Assign individual text descriptions to image areas defined by layers.
-* **Job Queue**: Queue and cancel generation jobs while working on your image.
-* **History**: Preview results and browse previous generations and prompts at any time.
-* **Strong Defaults**: Versatile default style presets allow for a streamlined UI.
-* **Customization**: Create your own presets - custom checkpoints, LoRA, samplers and more.
+### Flux 2 / Klein Workflow
 
-## <a name="installation"></a> Getting Started
+- Added Flux 2 focused style presets, including Klein variants.
+- Added Flux 2 sampler presets, including RES4LYF sampler options:
+  - `RES4LYF Flux 2 - RES 2M`
+  - `RES4LYF Flux 2 - RES 3M`
+  - `RES4LYF Flux 2 - RES 2S`
+  - `RES4LYF Flux 2 - RES 3S`
+  - `RES4LYF Flux 2 - DEIS 2M`
+- Patched the workflow path so Flux 2 uses the correct custom sampler flow.
+- Flux 2 CFG/guidance is intentionally disabled in the normal UI because the
+  old slider path did not produce real output changes.
+- Negative prompt remains disabled for Flux 2 in the current default path,
+  because the current Flux 2 BasicGuider flow does not use CFG-style negative
+  conditioning meaningfully.
+- The next planned experiment is an optional Flux 2 Scheduled CFGGuider path via
+  ComfyUI Inspire Pack.
 
-See the [Plugin Installation Guide](https://docs.interstice.cloud/installation) for instructions.
+### Guidance, Steps, and Denoise
 
-A concise (more technical) version is below:
+- Added sidebar sampler controls for steps and guidance where the active model
+  architecture actually supports them.
+- Kept Flux 2 guidance hidden in the sidebar because regular CFG was not wired
+  to an effective Flux 2 node.
+- Reworked denoise handling so edit denoise is not just a misleading bundled
+  steps display.
+- History metadata now records denoise, actual steps, and total steps when
+  applicable.
 
-### Operating System
+### Sidebar LoRA Controls
 
-Windows, Linux, MacOS
+- Added compact LoRA quick toggles in the generation sidebar.
+- LoRA entries can be enabled/disabled directly from the sidebar.
+- LoRA strength can be adjusted directly from the sidebar.
+- Sidebar LoRA area uses a compact two-column layout.
+- Sidebar LoRA area has a draggable height handle and remembers the chosen
+  visible row count.
+- LoRA sidebar labels support per-style custom display names.
+- LoRA sidebar hover text supports per-style descriptions and wraps long text.
+- Sidebar LoRA write-back preserves custom metadata fields.
 
-#### Hardware support
+### Style Settings LoRA Editing
 
-To run locally a powerful graphics card with at least 6 GB VRAM (NVIDIA) is
-recommended. Otherwise generating images will take very long or may fail due to
-insufficient memory!
+- Added drag-to-reorder for LoRAs in style settings.
+- Added per-LoRA `display_name` and `description` fields in the expanded LoRA
+  settings panel.
+- Added no-wheel combo boxes in settings so scrolling the page while hovering a
+  dropdown does not accidentally change LoRA, style, sampler, or performance
+  selections.
+- Existing LoRA trigger words and default strength behavior are preserved.
 
-<table>
-<tr><td>NVIDIA GPU</td><td>supported via CUDA (Windows/Linux)</td></tr>
-<tr><td>AMD GPU</td><td>supported but requires custom ComfyUI setup</td></tr>
-<tr><td>Apple Silicon</td><td>MPS (Apple Silicon) on macOS 14+</td></tr>
-<tr><td>CPU</td><td>supported, but very slow</td></tr>
-<tr><td>XPU</td><td>supported, may see performance issues (Windows/Linux)</td></tr>
-</table>
+Example LoRA style entry:
 
+```json
+{
+    "name": "FemaleTongueMouthTeeth-Klein.safetensors",
+    "strength": 1.5,
+    "enabled": true,
+    "display_name": "Mouth / Teeth Detail",
+    "description": "Suggested strength: 1.0-1.5. Helps with open mouth, tongue, teeth, lips, and related facial detail."
+}
+```
 
-### Installation
+### Quick Generation Styles
 
-1. If you haven't yet, go and install [Krita](https://krita.org/)! _Required version: 5.2.0 or newer_
-1. [Download the plugin](https://github.com/Acly/krita-ai-diffusion/releases/latest).
-2. Start Krita and install the plugin via Tools ▸ Scripts ▸ Import Python Plugin from File...
-    * Point it to the ZIP archive you downloaded in the previous step.
-    * Check [Krita's official documentation](https://docs.krita.org/en/user_manual/python_scripting/install_custom_python_plugin.html) for more options.
-3. Restart Krita and create a new document or open an existing image.
-4. To show the plugin docker: Settings ‣ Dockers ‣ AI Image Generation.
-5. In the plugin docker, click "Configure" to start local server installation or connect.
+- Added quick generation style buttons in the sidebar.
+- Quick style generation keeps the selected quick style's model/checkpoint/text
+  encoders but inherits current LoRAs and sampling settings from the active
+  style.
+- Quick style buttons now use a horizontal scroll strip instead of expanding or
+  squeezing the sidebar.
+- Quick style add/remove saves immediately.
 
-> [!NOTE]
-> If you encounter problems please check the [FAQ / list of common issues](https://docs.interstice.cloud/common-issues) for solutions.
->
-> Reach out via [discussions](https://github.com/Acly/krita-ai-diffusion/discussions), our [Discord](https://discord.gg/pWyzHfHHhU), or report [an issue here](https://github.com/Acly/krita-ai-diffusion/issues). Please note that official Krita channels are **not** the right place to seek help with
-> issues related to this extension!
+### Control Layers
 
-### _Optional:_ Custom ComfyUI Server
+- Added enabled/disabled toggles for control layers.
+- Disabled control layers are omitted from generation metadata.
+- Added hover tooltips explaining how each control layer behaves.
+- Added post-process style control layers:
+  - Color Match: helps preserve color and saturation from the source.
+  - Light Map: screen-blends a highlight/light map back into the output.
+- Color Match and Light Map expose percent strength in 5% steps.
+- Added icons and tests for the new control modes.
+- Control layers and their settings are now saved/restored with `.kra` project
+  persistence for the edit/root control layer path.
 
-The plugin uses [ComfyUI](https://github.com/comfyanonymous/ComfyUI) as backend.
-As an alternative to the automatic installation, you can install it manually or
-use an existing installation. If the server is already running locally before
-starting Krita, the plugin will automatically try to connect. Using a remote
-server is also possible this way.
+### History and Metadata
 
-Please check the list of [required extensions and models](https://docs.interstice.cloud/comfyui-setup) to make sure your installation is compatible.
+- Cleaned up generation history tooltip metadata formatting.
+- Added settings to hide/show prompt variants in history metadata:
+  - Prompt
+  - Prompt Evaluated
+  - Prompt Final
+- Text encoders now appear in history metadata when selected.
+- Disabled control layers no longer show as active history metadata.
+- New images are marked as new in history until selected.
+- History grouping is less noisy: repeated generations with the same meaningful
+  setup are grouped more compactly instead of splitting for every seed/tweak.
+- Added image comparison for two selected history images.
+- Metadata includes style, model, sampler, LoRAs, text encoders, control layers,
+  denoise, seed, and prompt details in a cleaner layout.
 
-### _Optional:_ Object selection tools (Segmentation)
+### Clipboard Paste
 
-If you're looking for a way to easily select objects or remove background in the
-image, there is a [separate plugin](https://github.com/Acly/krita-ai-tools)
-which adds AI segmentation tools.
+- Added a Krita action for pasting clipboard images as a new layer.
+- Wired the action so Ctrl+V can use the plugin paste path and avoid Krita's
+  `blob:` URL clipboard error.
 
+### Upscale and Utility Additions
 
-## Contributing
+- Added optional upscale noise injection controls.
+- Added VRAM display and a Free VRAM button in the sidebar.
+- Added progress detail plumbing from ComfyUI messages.
+- Added several robustness patches around ComfyUI/Nunchaku startup warnings and
+  Windows logging issues encountered during testing.
 
-Contributions are very welcome! Check the [contributing guide](CONTRIBUTING.md) to get started.
+### Text Encoder Selection
 
-## <a name="gallery"></a> Gallery
+- Added style-level text encoder override selection.
+- Text encoder selections are passed into workflow model loading.
+- Text encoder selections are included in history metadata.
+- Missing text encoder warnings now account for selected overrides.
 
-_Live painting with regions (Click for video)_
-[![Watch video demo](media/screenshot-regions.png)](https://youtu.be/PPxOE9YH57E "Watch video demo")
+## Current Scheduled CFG Plan
 
-_Inpainting on a photo using a realistic model_
-<img src="media/screenshot-2.png">
+Scheduled CFG is not implemented yet in this checkpoint.
 
-_Reworking and adding content to an AI generated image_
-<img src="media/screenshot-1.png">
+The planned experiment is:
 
-_Adding detail and iteratively refining small parts of the image_
-<img src="media/screenshot-3.png">
+- Detect whether ComfyUI Inspire Pack exposes `ScheduledCFGGuider`.
+- Add a Flux 2 only scheduled CFG path.
+- Route Flux 2 sampling through:
 
-_Modifying the pose vector layer to control character stances (Click for video)_
-[![Watch video demo](media/screenshot-5.png)](https://youtu.be/-QDPEcVmdLI "Watch video demo")
+```text
+positive + negative/empty conditioning + sigmas
+-> Scheduled CFGGuider (Inspire)
+-> SamplerCustomAdvanced
+```
 
-_Control layers: Scribble, Line art, Depth map, Pose_
-![Scribble control layer](media/control-scribble-screen.png)
-![Line art control layer](media/control-line-screen.png)
-![Depth map control layer](media/control-depth-screen.png)
-![Pose control layer](media/control-pose-screen.png)
+- Start with the reported values:
 
-## Technology
+```text
+from_cfg: 1.0
+to_cfg: 1.5
+schedule: exp
+```
 
-* Image generation: [Stable Diffusion](https://github.com/Stability-AI/generative-models), [Flux](https://blackforestlabs.ai/)
-* Diffusion backend: [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-* Inpainting: [ControlNet](https://github.com/lllyasviel/ControlNet), [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter)
+This should be compatible with RES4LYF in principle because RES4LYF is the
+sampler input and Scheduled CFG is the guider input to `SamplerCustomAdvanced`.
+
+## Local Development
+
+Restart Krita after Python/UI changes. The plugin is loaded by Krita at startup,
+so most UI and workflow edits are not hot-reloaded.
+
+Useful checks:
+
+```powershell
+python -m py_compile ai_diffusion\ui\widget.py ai_diffusion\ui\style.py ai_diffusion\ui\settings_widgets.py
+python -m pytest tests\test_workflow.py tests\test_comfy_workflow.py tests\test_api.py tests\test_settings.py tests\test_jobs.py -q
+git diff --check
+```
+
+Build/package commands from the upstream project still apply when needed:
+
+```powershell
+bun run build
+bun run package
+```
+
+## User Data Locations
+
+User styles are usually stored in:
+
+```text
+C:\Users\<user>\AppData\Roaming\krita\ai_diffusion\styles
+```
+
+Built-in/fork styles live in:
+
+```text
+ai_diffusion\styles
+```
+
+User settings are usually stored in:
+
+```text
+C:\Users\<user>\AppData\Roaming\krita\ai_diffusion\settings.json
+```
+
+## Upstream Project
+
+The original project provides the core plugin, installer, documentation, and
+model support:
+
+- Upstream repository: https://github.com/Acly/krita-ai-diffusion
+- User documentation: https://docs.interstice.cloud
+- ComfyUI backend: https://github.com/comfyanonymous/ComfyUI
+
+This fork is not a replacement for upstream documentation. It is a checkpoint of
+the local Flux 2 / UI-tweaks work so the fork can be pushed before testing the
+Scheduled CFG experiment.

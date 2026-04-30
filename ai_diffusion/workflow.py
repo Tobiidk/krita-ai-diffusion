@@ -59,7 +59,7 @@ def generate_seed():
 def sampling_from_style(style: Style, strength: float, is_live: bool):
     sampler_name = style.live_sampler if is_live else style.sampler
     cfg = style.live_cfg_scale if is_live else style.cfg_scale
-    min_steps, max_steps = style.get_steps(is_live=is_live)
+    _, max_steps = style.get_steps(is_live=is_live)
     preset = SamplerPresets.instance()[sampler_name]
     result = SamplingInput(
         sampler=preset.sampler,
@@ -68,8 +68,17 @@ def sampling_from_style(style: Style, strength: float, is_live: bool):
         total_steps=max_steps,
     )
     if strength < 1.0:
-        result.total_steps, result.start_step = apply_strength(strength, max_steps, min_steps)
+        result.total_steps, result.start_step = apply_denoise_strength(strength, max_steps)
     return result
+
+
+def apply_denoise_strength(strength: float, steps: int) -> tuple[int, int]:
+    """Keep requested sampling steps while limiting denoise to a later sigma range."""
+    if strength >= 1.0:
+        return steps, 0
+    strength = max(0.01, strength)
+    total_steps = max(steps, math.ceil(steps / strength))
+    return total_steps, total_steps - steps
 
 
 def apply_strength(strength: float, steps: int, min_steps: int = 0) -> tuple[int, int]:
@@ -89,9 +98,12 @@ def apply_strength(strength: float, steps: int, min_steps: int = 0) -> tuple[int
 # If the resulting step-count is adjusted upward as per above, no such
 # midpoint can be reliably determined. In that case, we return None.
 def snap_to_percent(steps: int, start_at_step: int, max_steps: int) -> int | None:
+    actual_steps = steps - start_at_step
+    if actual_steps == max_steps and steps > 0:
+        return round(actual_steps * 100 / steps)
     if steps != max_steps:
         return None
-    return round((steps - start_at_step) * 100 / steps)
+    return round(actual_steps * 100 / steps)
 
 
 def _sampler_params(sampling: SamplingInput, extent: Extent, strength: float | None = None):
@@ -141,30 +153,43 @@ def load_checkpoint_with_lora(w: ComfyWorkflow, checkpoint: CheckpointInput, mod
             )
 
     if clip is None or arch is Arch.sd3:
+        text_encoders = resolve_text_encoders(checkpoint, arch, models)
         te = models.for_arch(arch).text_encoder
+
+        def text_encoder(name: str):
+            return text_encoders.get(name) or te[name]
+
         match arch:
             case Arch.sd15:
-                clip = w.load_clip(te["clip_l"], "stable_diffusion")
+                clip = w.load_clip(text_encoder("clip_l"), "stable_diffusion")
             case Arch.sdxl | Arch.illu | Arch.illu_v:
-                clip = w.load_dual_clip(te["clip_g"], te["clip_l"], type="sdxl")
+                clip = w.load_dual_clip(
+                    text_encoder("clip_g"), text_encoder("clip_l"), type="sdxl"
+                )
             case Arch.sd3:
-                if te.find("t5"):
-                    clip = w.load_triple_clip(te["clip_l"], te["clip_g"], te["t5"])
+                if text_encoders.get("t5"):
+                    clip = w.load_triple_clip(
+                        text_encoder("clip_l"),
+                        text_encoder("clip_g"),
+                        text_encoder("t5"),
+                    )
                 else:
-                    clip = w.load_dual_clip(te["clip_g"], te["clip_l"], type="sd3")
+                    clip = w.load_dual_clip(
+                        text_encoder("clip_g"), text_encoder("clip_l"), type="sd3"
+                    )
             case Arch.flux | Arch.flux_k:
-                clip = w.load_dual_clip(te["clip_l"], te["t5"], type="flux")
+                clip = w.load_dual_clip(text_encoder("clip_l"), text_encoder("t5"), type="flux")
             case Arch.flux2_4b:
-                clip = w.load_clip(te["qwen_3_4b"], type="flux2")
+                clip = w.load_clip(text_encoder("qwen_3_4b"), type="flux2")
             case Arch.flux2_9b:
-                clip = w.load_clip(te["qwen_3_8b"], type="flux2")
+                clip = w.load_clip(text_encoder("qwen_3_8b"), type="flux2")
             case Arch.chroma:
-                clip = w.load_clip(te["t5"], type="chroma")
+                clip = w.load_clip(text_encoder("t5"), type="chroma")
                 clip = w.t5_tokenizer_options(clip, min_padding=1, min_length=0)
             case Arch.qwen | Arch.qwen_e | Arch.qwen_e_p | Arch.qwen_l:
-                clip = w.load_clip(te["qwen"], type="qwen_image")
+                clip = w.load_clip(text_encoder("qwen"), type="qwen_image")
             case Arch.zimage:
-                clip = w.load_clip(te["qwen_3_4b"], type="lumina2")
+                clip = w.load_clip(text_encoder("qwen_3_4b"), type="lumina2")
             case _:
                 raise RuntimeError(f"No text encoder for model architecture {arch.name}")
 
@@ -207,6 +232,28 @@ def load_checkpoint_with_lora(w: ComfyWorkflow, checkpoint: CheckpointInput, mod
         model = w.apply_self_attention_guidance(model)
 
     return model, Clip(clip, arch), vae
+
+
+def resolve_text_encoders(
+    checkpoint: CheckpointInput, arch: Arch, models: ClientModels
+) -> dict[str, str]:
+    model_info = models.checkpoints.get(checkpoint.checkpoint)
+    uses_external_clip = model_info is not None and (
+        model_info.format is FileFormat.diffusion or arch is Arch.sd3
+    )
+    if not uses_external_clip:
+        return {}
+
+    defaults = models.for_arch(arch).text_encoder
+    roles = list(arch.text_encoders)
+    if arch is Arch.sd3 and (checkpoint.text_encoders.get("t5") or defaults.find("t5")):
+        roles.append("t5")
+
+    result: dict[str, str] = {}
+    for role in roles:
+        if model := checkpoint.text_encoders.get(role) or defaults.find(role):
+            result[role] = model
+    return result
 
 
 def vae_encode(w: ComfyWorkflow, vae: Output, image: Output, tiled: bool):
@@ -615,6 +662,22 @@ def apply_control(
     return model, ConditioningOutput(positive, prompt.negative)
 
 
+def apply_post_process_control(
+    w: ComfyWorkflow,
+    image: Output,
+    control_layers: list[Control],
+    shape: Extent | ImageReshape,
+):
+    for control in (c for c in control_layers if c.mode.is_post_processing):
+        reference = control.image.load(w, shape)
+        strength = min(max(control.strength, 0.0), 1.0)
+        if control.mode is ControlMode.color_match:
+            image = w.color_match(image, reference, strength=strength)
+        elif control.mode is ControlMode.light_map:
+            image = w.image_blend(image, reference, strength=strength, mode="screen")
+    return image
+
+
 def apply_style_models(
     w: ComfyWorkflow, cond: Output, control_layers: list[Control], models: ModelDict
 ):
@@ -876,6 +939,7 @@ def generate(
     out_image = scale_refine_and_decode(
         extent, w, cond, sampling, out_latent, model_orig, clip, vae, models, checkpoint.tiled_vae
     )
+    out_image = apply_post_process_control(w, out_image, cond.all_control, extent.desired)
     out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
     out_image = scale_to_target(extent, w, out_image, models)
     w.send_image(out_image)
@@ -1129,6 +1193,7 @@ def inpaint(
         out_image = w.crop_image(out_image, desired_bounds)
         out_image = scale_to_target(cropped_extent, w, out_image, models)
 
+    out_image = apply_post_process_control(w, out_image, cond.all_control, target_bounds.extent)
     out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
     compositing_mask = denoise_to_compositing_mask(w, cropped_mask, params)
     out_masked = w.apply_mask(out_image, compositing_mask)
@@ -1164,6 +1229,7 @@ def refine(
     sampler = w.sampler_custom_advanced(model, prompt, latent_batch, models.arch, **sampler_params)
     sampler = pack_latent_layers(w, sampler, misc)
     out_image = vae_decode(w, vae, sampler, checkpoint.tiled_vae)
+    out_image = apply_post_process_control(w, out_image, cond.all_control, extent.desired)
     out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
     out_image = scale_to_target(extent, w, out_image, models)
     w.send_image(out_image)
@@ -1223,6 +1289,7 @@ def refine_region(
         extent, w, cond, sampling, out_latent, model_orig, clip, vae, models, checkpoint.tiled_vae
     )
     out_image = w.color_match(out_image, in_image, initial_mask, misc.color_match)
+    out_image = apply_post_process_control(w, out_image, cond.all_control, extent.desired)
     out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
     out_image = scale_to_target(extent, w, out_image, models)
     if extent.target != inpaint.target_bounds.extent:
@@ -1394,6 +1461,7 @@ def upscale_tiled(
         tile_result = vae_decode(w, vae, sampler, checkpoint.tiled_vae)
         out_image = w.merge_image_tile(out_image, tile_layout, i, tile_result)
 
+    out_image = apply_post_process_control(w, out_image, cond.all_control, extent.initial)
     out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
     if extent.initial != extent.target:
         out_image = scale(extent.initial, extent.target, ScaleMode.resize, w, out_image, models)
@@ -1535,11 +1603,14 @@ def build_instructions(cond: ConditioningInput, arch: Arch, inpaint: InpaintMode
         if instructions != "":
             cond.edit_reference = True
 
-    offset = 2 if cond.edit_reference else 1
-    for i, control in enumerate(cond.control):
+    image_index = 2 if cond.edit_reference else 1
+    for control in cond.control:
         if instruction := _control_instructions.get(control.mode):
-            instructions += instruction.format(offset + i) + "\n"
+            instructions += instruction.format(image_index) + "\n"
             control.mode = ControlMode.reference
+            image_index += 1
+        elif control.mode.is_ip_adapter:
+            image_index += 1
 
     if instructions != "":
         return f"{instructions}\n{cond.positive}"
@@ -1588,7 +1659,7 @@ def prepare_prompts(
         meta["prompt_final"] = merge_prompt(cond.positive, cond.style, cond.language)
 
     cfg = style.live_cfg_scale if is_live else style.cfg_scale
-    if cfg == 1.0:
+    if cfg == 1.0 or not arch.supports_cfg:
         cond.negative = ""  # CFG 1 does not use negative prompt
     else:
         cond.negative = strip_prompt_comments(cond.negative)
@@ -1956,6 +2027,17 @@ def _check_server_has_models(
                 style=style_name,
             )
         )
+    for name, text_encoder in input.text_encoders.items():
+        if text_encoder and text_encoder not in models.text_encoders:
+            raise ValueError(
+                _(
+                    "The text encoder '{text_encoder}' used for {name} by style "
+                    "'{style}' is not available on the server",
+                    text_encoder=text_encoder,
+                    name=name,
+                    style=style_name,
+                )
+            )
 
 
 def _check_inpaint_model(inpaint: InpaintParams | None, arch: Arch, models: ClientModels):

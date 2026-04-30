@@ -40,6 +40,7 @@ from .client import (
     is_style_supported,
     resolve_arch,
 )
+from .comfy_client import ProgressDetails
 from .connection import Connection, ConnectionState
 from .control import ControlLayer
 from .custom_workflow import (
@@ -123,6 +124,33 @@ class Error(NamedTuple):
 no_error = Error(ErrorKind.none, "")
 
 
+_quick_style_base_fields = (
+    "version",
+    "name",
+    "architecture",
+    "checkpoints",
+    "style_prompt",
+    "negative_prompt",
+    "vae",
+    "text_encoders",
+    "clip_skip",
+    "v_prediction_zsnr",
+    "rescale_cfg",
+    "self_attention_guidance",
+    "preferred_resolution",
+    "linked_edit_style",
+)
+_quick_style_current_fields = (
+    "loras",
+    "sampler",
+    "sampler_steps",
+    "cfg_scale",
+    "live_sampler",
+    "live_sampler_steps",
+    "live_cfg_scale",
+)
+
+
 class Model(QObject, ObservableProperties):
     """Represents diffusion workflows for a specific Krita document. Stores all inputs related to
     image generation. Launches generation jobs. Listens to server messages and keeps a
@@ -160,6 +188,8 @@ class Model(QObject, ObservableProperties):
     progress_kind_changed = pyqtSignal(ProgressKind)
     progress_changed = pyqtSignal(float)
     error_changed = pyqtSignal(Error)
+    effective_style_changed = pyqtSignal()
+    progress_details_changed = pyqtSignal()
     modified = pyqtSignal(QObject, str)
 
     def __init__(self, document: Document, connection: Connection, workflows: WorkflowCollection):
@@ -177,11 +207,15 @@ class Model(QObject, ObservableProperties):
         self.animation = AnimationWorkspace(self)
         self.custom = CustomWorkspace(workflows, self._generate_custom, self.jobs)
         self._style_connection: QMetaObject.Connection | None = None
+        self._progress_details = ProgressDetails()
 
         self.jobs.selection_changed.connect(self.update_preview)
         connection.state_changed.connect(self._init_on_connect)
         connection.error_changed.connect(self._forward_error)
         self.custom.validation_error_changed.connect(self._forward_validation_error)
+        self.workspace_changed.connect(self._emit_effective_style_changed)
+        self.edit_mode_changed.connect(self._emit_effective_style_changed)
+        self.animation.sampling_quality_changed.connect(self._emit_effective_style_changed)
         Styles.list().changed.connect(self._init_on_connect)
         self._init_on_connect()
 
@@ -212,7 +246,23 @@ class Model(QObject, ObservableProperties):
         """Enqueue image generation with queue mode set to replace."""
         self._generate(QueueMode.replace)
 
-    def _generate(self, queue_mode: QueueMode):
+    def generate_with_style(self, style: Style):
+        """Enqueue image generation using a different style, without switching the active style."""
+        self._generate(self.queue_mode, style_override=self._quick_style_override(style))
+
+    def _quick_style_override(self, style: Style):
+        current = self.active_style
+        if current is style:
+            return style
+
+        merged = Style(style.filepath)
+        for name in _quick_style_base_fields:
+            setattr(merged, name, copy(getattr(style, name)))
+        for name in _quick_style_current_fields:
+            setattr(merged, name, copy(getattr(current, name)))
+        return merged
+
+    def _generate(self, queue_mode: QueueMode, style_override: Style | None = None):
         """Enqueue image generation for the current setup."""
         ok, msg = self._doc.check_color_mode()
         if not ok and msg:
@@ -220,18 +270,22 @@ class Model(QObject, ObservableProperties):
             return
 
         try:
-            input, job_params, cond_orig = self._prepare_workflow()
+            input, job_params, cond_orig = self._prepare_workflow(
+                style_override=style_override
+            )
         except Exception as e:
             self.report_error(util.log_error(e))
             return
         self.clear_error()
         jobs = self.enqueue_jobs(
-            input, JobKind.diffusion, job_params, cond_orig, self.batch_count, queue_mode
+            input, JobKind.diffusion, job_params, cond_orig, self.batch_count, queue_mode,
+            style_override=style_override,
         )
         eventloop.run(_report_errors(self, jobs))
 
-    def _prepare_workflow(self, dryrun=False):
-        arch = self.arch
+    def _prepare_workflow(self, dryrun=False, style_override: Style | None = None):
+        style = style_override or self.active_style
+        arch = resolve_arch(style, self._connection.client_if_connected)
         workflow_kind = WorkflowKind.generate
         strength = self.strength
         if arch is Arch.qwen_l:
@@ -271,7 +325,7 @@ class Model(QObject, ObservableProperties):
             conditioning = self._add_reference_layers(conditioning)
         original_conditioning = conditioning
         conditioning, loras, prompt_meta = workflow.prepare_prompts(
-            conditioning, self.style, seed, arch, inpaint_mode if strength == 1.0 else None
+            conditioning, style, seed, arch, inpaint_mode if strength == 1.0 else None
         )
 
         if mask is not None or workflow_kind is WorkflowKind.refine:
@@ -298,7 +352,7 @@ class Model(QObject, ObservableProperties):
             workflow_kind,
             image or extent,
             conditioning,
-            self.active_style,
+            style,
             seed,
             client.models,
             FileLibrary.instance(),
@@ -309,16 +363,26 @@ class Model(QObject, ObservableProperties):
             inpaint=inpaint,
             layer_count=self.layer_count,
         )
-        loras = input.models.loras if input.models else []
+        input_models = ensure(input.models)
+        loras = input_models.loras
         job_name = prompt_meta.get("prompt_eval", prompt_meta["prompt"])
         job_params = JobParams(bounds, job_name, regions=job_regions)
-        job_params.set_style(self.active_style, ensure(input.models).checkpoint)
+        job_params.set_style(
+            style,
+            input_models.checkpoint,
+            workflow.resolve_text_encoders(input_models, arch, client.models),
+            include_guidance=arch.supports_guidance_scale,
+        )
         job_params.set_control(regions.control)
         job_params.inpaint_mode = inpaint_mode
         job_params.is_layered = arch is Arch.qwen_l
         job_params.metadata.update(prompt_meta)
         job_params.metadata["loras"] = [{"name": l.name, "weight": l.strength} for l in loras]
         job_params.metadata["strength"] = strength
+        if input.sampling and input.sampling.denoise_strength < 1.0:
+            job_params.metadata["denoise"] = round(input.sampling.denoise_strength, 3)
+            job_params.metadata["actual_steps"] = input.sampling.actual_steps
+            job_params.metadata["total_steps"] = input.sampling.total_steps
         return input, job_params, original_conditioning
 
     async def enqueue_jobs(
@@ -329,7 +393,10 @@ class Model(QObject, ObservableProperties):
         original_cond: ConditioningInput | None = None,
         count: int = 1,
         queue_mode: QueueMode | None = None,
+        style_override: Style | None = None,
     ):
+        style = style_override or self.style
+        arch = resolve_arch(style, self._connection.client_if_connected)
         sampling = ensure(input.sampling)
         params.has_mask = input.images is not None and input.images.hires_mask is not None
         queue_mode = queue_mode or self.queue_mode
@@ -346,7 +413,7 @@ class Model(QObject, ObservableProperties):
                 input = replace(input, sampling=replace(sampling, seed=seed))
                 if original_cond:  # re-evaluate wildcards in prompts after the seed change
                     next_prompt = workflow.prepare_prompts(
-                        original_cond, self.style, seed, self.arch, params.inpaint_mode
+                        original_cond, style, seed, arch, params.inpaint_mode
                     )
                     input.conditioning = next_prompt.conditioning
                     params.metadata = params.metadata | next_prompt.metadata
@@ -364,11 +431,14 @@ class Model(QObject, ObservableProperties):
         client = self._connection.client
         job.id = await client.enqueue(input, front)
 
-    def _prepare_upscale_image(self, dryrun=False):
+    def _prepare_upscale_image(self, dryrun=False, factor_override: float | None = None):
         client = self._connection.client
         extent = self._doc.extent
         image = self._doc.get_image(Bounds(0, 0, *extent)) if not dryrun else DummyImage(extent)
         params = self.upscale.params
+        if factor_override is not None:
+            target = extent * factor_override
+            params = replace(params, factor=factor_override, target_extent=target)
         params.upscale.model = params.upscale.model or client.models.default_upscaler
         if params.upscale.model not in client.models.upscalers:
             msg = _("The upscale model used by the document is not available on the server")
@@ -415,9 +485,23 @@ class Model(QObject, ObservableProperties):
         return input, job_params
 
     def upscale_image(self):
+        factor_override = None
+        if self.upscale.inject_noise:
+            try:
+                target = self.upscale.target_extent
+                if target != self._doc.extent:
+                    self._doc.resize(target)
+                self._inject_noise_layer(self.upscale.noise_strength)
+                factor_override = 1.0
+            except Exception as e:
+                self.report_error(util.log_error(e))
+                return
+
         try:
             self.clear_error()
-            inputs, job_params = self._prepare_upscale_image()
+            inputs, job_params = self._prepare_upscale_image(
+                factor_override=factor_override
+            )
             job = self.jobs.add(JobKind.upscaling, job_params)
         except Exception as e:
             self.report_error(util.log_error(e))
@@ -428,6 +512,30 @@ class Model(QObject, ObservableProperties):
 
         self._doc.resize(job.params.bounds.extent)
         self.upscale.target_extent_changed.emit(self.upscale.target_extent)
+
+    def _inject_noise_layer(self, opacity_factor: float):
+        """Create a paint layer with Gaussian noise at the given opacity (0-1)."""
+        import random
+        import struct
+
+        from PyQt5.QtCore import QByteArray
+
+        extent = self._doc.extent
+        image = self._doc.get_image(Bounds(0, 0, *extent))
+        src = bytes(image.data)
+        pixel_count = extent.width * extent.height * 4
+
+        # Generate noisy version: add Gaussian noise (std=128) per channel, clamp 0-255
+        result = bytearray(pixel_count)
+        gauss = random.gauss
+        for i in range(pixel_count):
+            val = src[i] + int(gauss(0, 128))
+            result[i] = max(0, min(255, val))
+
+        noisy_image = Image.from_packed_bytes(QByteArray(bytes(result)), extent, channels=4)
+        bounds = Bounds(0, 0, *extent)
+        layer = self.layers.create("Noise Injection", noisy_image, bounds, make_active=False)
+        layer.node.setOpacity(int(opacity_factor * 255))
 
     def estimate_cost(self, kind=JobKind.diffusion):
         try:
@@ -556,7 +664,12 @@ class Model(QObject, ObservableProperties):
                     custom_input.models.loras + prepared.loras, key=lambda l: l.name
                 )
 
-                job_params.set_style(self.style, custom_input.models.checkpoint)
+                job_params.set_style(
+                    self.style,
+                    custom_input.models.checkpoint,
+                    workflow.resolve_text_encoders(custom_input.models, arch, client.models),
+                    include_guidance=arch.supports_guidance_scale,
+                )
                 metadata.update(prepared.metadata)
                 metadata["loras"] = [
                     {"name": l.name, "weight": l.strength} for l in custom_input.models.loras
@@ -663,6 +776,9 @@ class Model(QObject, ObservableProperties):
             self.jobs.notify_started(job)
             self.progress_kind = ProgressKind.generation
             self.progress = message.progress
+            if message.progress_details is not None:
+                self._progress_details = message.progress_details
+                self.progress_details_changed.emit()
         elif message.event is ClientEvent.upload:
             self.jobs.notify_started(job)
             self.progress_kind = ProgressKind.upload
@@ -690,9 +806,16 @@ class Model(QObject, ObservableProperties):
             assert isinstance(message.error, str) and isinstance(message.result, dict)
             self.report_error(Error(ErrorKind.insufficient_funds, message.error, message.result))
 
+    @property
+    def progress_details(self) -> ProgressDetails:
+        return self._progress_details
+
     def _finish_job(self, job: Job, event: ClientEvent):
         if job.kind is JobKind.upscaling:
             self.upscale.set_in_progress(False)
+
+        self._progress_details = ProgressDetails()
+        self.progress_details_changed.emit()
 
         if event is ClientEvent.finished:
             self.jobs.notify_finished(job)
@@ -913,10 +1036,15 @@ class Model(QObject, ObservableProperties):
             self.style_changed.emit(style)
             self.modified.emit(self, "style")
             self.edit_mode = self.is_editing
+            self.effective_style_changed.emit()
 
     def _handle_style_changed(self):
         self.style_changed.emit(self.style)
         self.edit_mode = self.is_editing
+        self.effective_style_changed.emit()
+
+    def _emit_effective_style_changed(self, *_args):
+        self.effective_style_changed.emit()
 
     def generate_seed(self):
         self.seed = workflow.generate_seed()
@@ -978,6 +1106,23 @@ class Model(QObject, ObservableProperties):
         ):
             return self.edit_style
         return self.style
+
+    @property
+    def is_live_mode(self) -> bool:
+        """Whether the current context uses live sampler settings (live workspace or
+        animation with fast sampling quality)."""
+        if self.workspace is Workspace.live:
+            return True
+        if self.workspace is Workspace.animation:
+            return self.animation.sampling_quality is SamplingQuality.fast
+        return False
+
+    def effective_sampler_values(self) -> tuple[int, float]:
+        """Return (steps, cfg) for the current effective style and workspace context."""
+        style = self.active_style
+        if self.is_live_mode:
+            return style.live_sampler_steps, style.live_cfg_scale
+        return style.sampler_steps, style.cfg_scale
 
     def _track_style_usage(self, style: Style):
         if count := settings.recent_styles_count:
@@ -1117,6 +1262,8 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     tile_overlap_mode = Property(TileOverlapMode.auto, persist=True)
     tile_overlap = Property(48, persist=True)
     use_prompt = Property(False, persist=True)
+    inject_noise = Property(False, persist=True)
+    noise_strength = Property(0.1, persist=True)
     can_generate = Property(True)
 
     upscaler_changed = pyqtSignal(str)
@@ -1127,6 +1274,8 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     tile_overlap_mode_changed = pyqtSignal(TileOverlapMode)
     tile_overlap_changed = pyqtSignal(int)
     use_prompt_changed = pyqtSignal(bool)
+    inject_noise_changed = pyqtSignal(bool)
+    noise_strength_changed = pyqtSignal(float)
     target_extent_changed = pyqtSignal(Extent)
     can_generate_changed = pyqtSignal(bool)
     modified = pyqtSignal(QObject, str)

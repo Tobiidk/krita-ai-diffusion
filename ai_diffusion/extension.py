@@ -3,9 +3,20 @@ from collections.abc import Callable
 from pathlib import Path
 
 from krita import DockWidgetFactory, DockWidgetFactoryBase, Extension, Krita, Window  # type: ignore
-from PyQt5.QtWidgets import QAction
+from PyQt5.QtCore import QEvent
+from PyQt5.QtGui import QKeyEvent, QKeySequence
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QAbstractSpinBox,
+    QComboBox,
+    QLineEdit,
+    QPlainTextEdit,
+    QTextEdit,
+)
 
 from . import __version__, eventloop
+from .localization import translate as _
 from .model import Workspace
 from .root import root
 from .settings import settings
@@ -19,6 +30,7 @@ class AIToolsExtension(Extension):
     def __init__(self, parent):
         super().__init__(parent)
         self._actions: dict[str, QAction] = {}
+        self._event_filter_installed = False
 
         log.info(f"Extension initialized, Version: {__version__}, Python: {sys.version}")
 
@@ -49,16 +61,61 @@ class AIToolsExtension(Extension):
         notifier = Krita.instance().notifier()
         notifier.setActive(True)
         notifier.applicationClosing.connect(self.shutdown)  # type: ignore
+        if app := QApplication.instance():
+            app.installEventFilter(self)
+            self._event_filter_installed = True
 
     def setup(self):
         eventloop.run(root.autostart(self._settings_dialog.connection.update_ui))
 
     def shutdown(self):
+        if self._event_filter_installed:
+            if app := QApplication.instance():
+                app.removeEventFilter(self)
+            self._event_filter_installed = False
         root.server.terminate()
         eventloop.stop()
 
-    def _create_action(self, window: Window, name: str, func: Callable[[], None]):
-        action = window.createAction(f"ai_diffusion_{name}", "", "")
+    def eventFilter(self, watched, event):
+        if (
+            event is not None
+            and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+            and isinstance(event, QKeyEvent)
+            and event.matches(QKeySequence.StandardKey.Paste)
+            and self._should_handle_image_paste()
+        ):
+            event.accept()
+            if event.type() == QEvent.Type.KeyPress:
+                actions.paste_clipboard_image()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _should_handle_image_paste(self):
+        if QApplication.activeModalWidget() is not None:
+            return False
+        if root.model_for_active_document() is None:
+            return False
+        if self._focus_accepts_text():
+            return False
+        return actions.clipboard_may_contain_image()
+
+    def _focus_accepts_text(self):
+        widget = QApplication.focusWidget()
+        if widget is None:
+            return False
+        if isinstance(widget, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox)):
+            return True
+        parent = widget
+        while parent is not None:
+            if isinstance(parent, QComboBox) and parent.isEditable():
+                return True
+            parent = parent.parentWidget()
+        return False
+
+    def _create_action(
+        self, window: Window, name: str, func: Callable[[], None], text="", menu=""
+    ):
+        action = window.createAction(f"ai_diffusion_{name}", text, menu)
         action.triggered.connect(func)
         self._actions[name] = action
 
@@ -84,6 +141,13 @@ class AIToolsExtension(Extension):
         )
         self._create_action(window, "toggle_workspace", actions.toggle_workspace)
         self._create_action(window, "toggle_edit_mode", actions.toggle_edit_mode)
+        self._create_action(
+            window,
+            "paste_clipboard_image",
+            actions.paste_clipboard_image,
+            _("Paste Clipboard Image as Layer"),
+            "tools/scripts",
+        )
 
 
 Krita.instance().addExtension(AIToolsExtension(Krita.instance()))

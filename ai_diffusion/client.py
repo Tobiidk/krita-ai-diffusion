@@ -78,6 +78,7 @@ class ClientMessage(NamedTuple):
     images: ImageCollection | None = None
     result: ClientOutput | None = None
     error: str | None = None
+    progress_details: Any = None  # ProgressDetails from comfy_client, optional
 
 
 class User(QObject, ObservableProperties):
@@ -227,6 +228,7 @@ class ClientModels:
     def __init__(self) -> None:
         self.checkpoints: dict[str, CheckpointInfo] = {}
         self.vae: list[str] = []
+        self.text_encoders: list[str] = []
         self.loras: list[str] = []
         self.upscalers: list[str] = []
         self.node_inputs = ComfyObjectInfo({})
@@ -239,6 +241,7 @@ class ClientModels:
             k: CheckpointInfo.from_dict(v) for k, v in data.get("checkpoints", {}).items()
         }
         models.vae = data.get("vae", [])
+        models.text_encoders = data.get("text_encoders", [])
         models.loras = data.get("loras", [])
         models.upscalers = data.get("upscalers", [])
         models.resources = data.get("resources", {})

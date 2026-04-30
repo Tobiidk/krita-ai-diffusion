@@ -15,13 +15,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..control import ControlLayer, ControlLayerList
+from ..control import ControlLayer, ControlLayerList, control_mode_tooltip
 from ..localization import translate as _
 from ..properties import Binding, bind, bind_combo, bind_toggle
 from ..resources import ControlMode
 from ..root import root
 from . import theme
 from .interval_slider import IntervalSlider
+from .switch import SwitchWidget
 from .theme import SignalBlocker
 
 
@@ -40,9 +41,15 @@ class ControlWidget(QWidget):
 
         self.mode_select = QComboBox(self)
         self.mode_select.setStyleSheet(theme.flat_combo_stylesheet)
+        self.mode_select.view().setMouseTracking(True)
         for mode in (m for m in ControlMode if not m.is_internal):
             icon = theme.icon(f"control-{mode.name}")
             self.mode_select.addItem(icon, mode.text, mode)
+            self.mode_select.setItemData(
+                self.mode_select.count() - 1,
+                control_mode_tooltip(mode),
+                Qt.ItemDataRole.ToolTipRole,
+            )
 
         self.layer_select = QComboBox(self)
         self.layer_select.setMinimumContentsLength(20)
@@ -62,6 +69,8 @@ class ControlWidget(QWidget):
         self.preset_slider.setTickInterval(2)
         self.preset_slider.setTickPosition(QSlider.TickPosition.TicksBothSides)
         self.preset_slider.setToolTip(_("Control strength: how much the layer affects the image"))
+        self.preset_value_label = QLabel(self)
+        self.preset_value_label.setMinimumWidth(34)
 
         self.error_text = QLabel(self)
         self.error_text.setStyleSheet(f"QLabel {{ color: {theme.yellow}; }}")
@@ -78,6 +87,10 @@ class ControlWidget(QWidget):
         )
         self.add_pose_tool_button.clicked.connect(self._add_pose_character)
 
+        self.enabled_toggle = SwitchWidget(self)
+        self.enabled_toggle.setChecked(control.enabled)
+        self.enabled_toggle.setToolTip(_("Enable/disable this control layer"))
+
         self.expand_button = QToolButton(self)
         self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.expand_button.setIcon(theme.icon("more"))
@@ -93,7 +106,9 @@ class ControlWidget(QWidget):
         bar_layout.addWidget(self.generate_tool_button)
         bar_layout.addWidget(self.add_pose_tool_button)
         bar_layout.addWidget(self.preset_slider, 1)
+        bar_layout.addWidget(self.preset_value_label)
         bar_layout.addWidget(self.error_text, 3)
+        bar_layout.addWidget(self.enabled_toggle)
         bar_layout.addWidget(self.expand_button)
         layout.addLayout(bar_layout)
 
@@ -172,6 +187,8 @@ class ControlWidget(QWidget):
         extended_layout.addLayout(slider_layout)
 
         self._update_visibility()
+        self._update_mode_tooltip()
+        self._update_preset_slider()
         self._update_pose_utils()
         self._update_strength()
         self._update_range()
@@ -180,10 +197,13 @@ class ControlWidget(QWidget):
         self._connections = [
             bind_combo(control, "mode", self.mode_select),
             bind_combo(control, "layer_id", self.layer_select),
+            bind_toggle(control, "enabled", self.enabled_toggle),
             bind_toggle(control, "use_custom_strength", self.custom_checkbox),
-            bind(control, "preset_value", self.preset_slider, "value"),
             bind(control, "strength", self.strength_slider, "value"),
+            self.preset_slider.valueChanged.connect(self._set_preset_slider_value),
             control.use_custom_strength_changed.connect(self._update_custom_values),
+            control.preset_value_changed.connect(self._update_preset_slider),
+            control.post_strength_percent_changed.connect(self._update_preset_slider),
             control.strength_changed.connect(self._update_strength),
             control.start_changed.connect(self._update_range),
             control.end_changed.connect(self._update_range),
@@ -193,6 +213,10 @@ class ControlWidget(QWidget):
             control.has_range_changed.connect(self._update_visibility),
             control.can_generate_changed.connect(self._update_visibility),
             control.mode_changed.connect(self._update_visibility),
+            control.mode_changed.connect(self._update_mode_tooltip),
+            control.mode_changed.connect(self._update_preset_slider),
+            control.mode_changed.connect(self._update_custom_values),
+            self.mode_select.currentIndexChanged.connect(self._update_mode_tooltip),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
             root.active_model.style_changed.connect(self._update_visibility),
         ]
@@ -225,15 +249,25 @@ class ControlWidget(QWidget):
     def _add_pose_character(self):
         root.active_model.document.add_pose_character(self._control.layer)
 
+    def _update_mode_tooltip(self, *args):
+        mode = self.mode_select.currentData()
+        if isinstance(mode, ControlMode):
+            self.mode_select.setToolTip(control_mode_tooltip(mode))
+
     def _update_visibility(self):
         is_small = self.width() < 420
         is_pose = self._control.mode is ControlMode.pose
         is_edit = root.active_model.arch.supports_edit
+        has_strength_controls = not is_edit or self._control.mode.is_post_processing
+        has_advanced_controls = not is_edit and not self._control.mode.is_post_processing
 
         def controls():
             self.layer_select.setVisible(self._control.is_supported)
-            self.preset_slider.setVisible(self._control.is_supported and not is_edit)
-            self.expand_button.setVisible(self._control.is_supported and not is_edit)
+            self.preset_slider.setVisible(self._control.is_supported and has_strength_controls)
+            self.preset_value_label.setVisible(
+                self._control.is_supported and self._control.mode.is_post_processing
+            )
+            self.expand_button.setVisible(self._control.is_supported and has_advanced_controls)
             self.generate_button.setVisible(self._control.can_generate and is_small)
             self.generate_tool_button.setVisible(self._control.can_generate and not is_small)
             self.add_pose_button.setVisible(is_pose and is_small)
@@ -242,7 +276,7 @@ class ControlWidget(QWidget):
             self.range_slider.setVisible(self._control.has_range)
             self.range_start_label.setVisible(self._control.has_range)
             self.range_end_label.setVisible(self._control.has_range)
-            if not self._control.is_supported or is_edit:
+            if not self._control.is_supported or not has_advanced_controls:
                 self.expand_button.setChecked(False)
 
         def error():
@@ -264,6 +298,37 @@ class ControlWidget(QWidget):
         self._control.start = low / 20
         self._control.end = high / 20
 
+    def _update_preset_slider(self, *args):
+        with SignalBlocker(self.preset_slider):
+            if self._control.mode.is_post_processing:
+                self.preset_slider.setRange(0, 20)
+                self.preset_slider.setSingleStep(1)
+                self.preset_slider.setPageStep(2)
+                self.preset_slider.setTickInterval(2)
+                self.preset_slider.setValue(round(self._control.post_strength_percent / 5))
+                self.preset_value_label.setText(f"{self._control.post_strength_percent}%")
+                self.preset_slider.setToolTip(
+                    _("Post-process strength: {value}%").format(
+                        value=self._control.post_strength_percent
+                    )
+                )
+            else:
+                self.preset_slider.setRange(0, self._control.max_preset_value)
+                self.preset_slider.setSingleStep(1)
+                self.preset_slider.setPageStep(2)
+                self.preset_slider.setTickInterval(2)
+                self.preset_slider.setValue(self._control.preset_value)
+                self.preset_value_label.setText("")
+                self.preset_slider.setToolTip(
+                    _("Control strength: how much the layer affects the image")
+                )
+
+    def _set_preset_slider_value(self, value: int):
+        if self._control.mode.is_post_processing:
+            self._control.post_strength_percent = value * 5
+        else:
+            self._control.preset_value = value
+
     def _update_strength(self):
         self.strength_label.setText(
             f"{self._control.strength / ControlLayer.strength_multiplier:.2f}"
@@ -275,7 +340,9 @@ class ControlWidget(QWidget):
         self.layer_select.setEnabled(not self._control.has_active_job)
 
     def _update_custom_values(self):
-        self.preset_slider.setEnabled(not self._control.use_custom_strength)
+        self.preset_slider.setEnabled(
+            self._control.mode.is_post_processing or not self._control.use_custom_strength
+        )
         self.strength_slider.setEnabled(self._control.use_custom_strength)
         self.range_slider.setEnabled(self._control.use_custom_strength)
 

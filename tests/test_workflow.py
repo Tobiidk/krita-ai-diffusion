@@ -8,6 +8,7 @@ import pytest
 
 from ai_diffusion import workflow
 from ai_diffusion.api import (
+    CheckpointInput,
     ConditioningInput,
     ControlInput,
     CustomWorkflowInput,
@@ -26,10 +27,10 @@ from ai_diffusion.client import CheckpointInfo, Client, ClientEvent, ClientModel
 from ai_diffusion.cloud_client import CloudClient
 from ai_diffusion.comfy_client import ComfyClient
 from ai_diffusion.comfy_workflow import ComfyWorkflow
-from ai_diffusion.files import File, FileCollection, FileLibrary, FileSource
+from ai_diffusion.files import File, FileCollection, FileFormat, FileLibrary, FileSource
 from ai_diffusion.image import Bounds, Extent, Image, ImageCollection, Mask
 from ai_diffusion.pose import Pose
-from ai_diffusion.resources import ControlMode
+from ai_diffusion.resources import ControlMode, ResourceId, ResourceKind
 from ai_diffusion.settings import PerformanceSettings
 from ai_diffusion.style import Arch, Style
 from ai_diffusion.util import ensure
@@ -86,6 +87,18 @@ default_seed = 1234
 default_perf = PerformanceSettings(batch_size=1)
 
 
+def test_sampling_denoise_keeps_requested_steps():
+    style = Style(Path("default.json"))
+    style.sampler = "Default - DPM++ 2M"
+    style.sampler_steps = 20
+
+    sampling = workflow.sampling_from_style(style, strength=0.5, is_live=False)
+
+    assert sampling.actual_steps == 20
+    assert sampling.total_steps == 40
+    assert sampling.denoise_strength == 0.5
+
+
 def default_style(client: Client, arch=Arch.sd15):
     version_checkpoints = [
         name for name, cp in client.models.checkpoints.items() if cp.arch is arch
@@ -105,7 +118,7 @@ def default_style(client: Client, arch=Arch.sd15):
         style.sampler_steps = 8
     if arch.is_flux2:
         style.sampler = "Flux 2 - Euler"
-        style.cfg_scale = 1.0
+        style.cfg_scale = 3.5
         style.sampler_steps = 5
     return style
 
@@ -212,6 +225,10 @@ def test_inpaint_params():
     prompt.control = [ControlInput(ControlMode.line_art, Image.create(Extent(4, 4)))]
     e = detect_inpaint(InpaintMode.add_object, bounds, Arch.sd15, prompt, 1.0)
     assert not e.use_condition_mask
+
+    prompt.control = [ControlInput(ControlMode.color_match, Image.create(Extent(4, 4)))]
+    g = detect_inpaint(InpaintMode.add_object, bounds, Arch.sd15, prompt, 1.0)
+    assert g.use_condition_mask
 
     prompt.edit_reference = True
     f = detect_inpaint(InpaintMode.fill, bounds, Arch.sd15, prompt, 1.0)
@@ -378,6 +395,150 @@ def test_prepare_prompt_inpaint():
     expected_prompt = "Remove the object.\n\ninpaint prompt"
     assert result.conditioning.positive == expected_prompt
     assert result.conditioning.edit_reference
+
+
+def test_color_match_control_does_not_shift_edit_image_numbers():
+    cond = ConditioningInput("edit prompt")
+    cond.control = [
+        ControlInput(ControlMode.color_match, Image.create(Extent(4, 4))),
+        ControlInput(ControlMode.light_map, Image.create(Extent(4, 4))),
+        ControlInput(ControlMode.composition, Image.create(Extent(4, 4))),
+    ]
+
+    result = workflow.prepare_prompts(
+        cond, Style(Path("default.json")), 1, Arch.flux2_4b, files=files
+    )
+
+    assert result.conditioning.control[0].mode is ControlMode.color_match
+    assert result.conditioning.control[1].mode is ControlMode.light_map
+    assert result.conditioning.control[2].mode is ControlMode.reference
+    assert result.conditioning.positive.startswith(
+        "Maintain the structure and composition from image 1."
+    )
+
+
+def test_color_match_control_adds_post_process_node():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.sd15)}
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    cond = ConditioningInput(
+        "test",
+        control=[ControlInput(ControlMode.color_match, Image.create(Extent(512, 512)), 0.7)],
+    )
+
+    work = workflow.prepare(
+        WorkflowKind.generate,
+        Extent(512, 512),
+        cond,
+        style,
+        1,
+        models,
+        FileLibrary(FileCollection(), FileCollection()),
+        PerformanceSettings(batch_size=1),
+    )
+    graph = workflow.create(work, models)
+    node_types = [node["class_type"] for node in graph.root.values()]
+    color_match = next(
+        node for node in graph.root.values() if node["class_type"] == "INPAINT_ColorMatch"
+    )
+
+    assert "INPAINT_ColorMatch" in node_types
+    assert color_match["inputs"]["strength"] == 0.7
+    assert "ControlNetApplyAdvanced" not in node_types
+
+
+def test_light_map_control_adds_screen_blend_node():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.sd15)}
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    cond = ConditioningInput(
+        "test",
+        control=[ControlInput(ControlMode.light_map, Image.create(Extent(512, 512)), 0.35)],
+    )
+
+    work = workflow.prepare(
+        WorkflowKind.generate,
+        Extent(512, 512),
+        cond,
+        style,
+        1,
+        models,
+        FileLibrary(FileCollection(), FileCollection()),
+        PerformanceSettings(batch_size=1),
+    )
+    graph = workflow.create(work, models)
+    blend = next(node for node in graph.root.values() if node["class_type"] == "ImageBlend")
+
+    assert blend["inputs"]["blend_mode"] == "screen"
+    assert blend["inputs"]["blend_factor"] == 0.35
+    assert "ControlNetApplyAdvanced" not in [
+        node["class_type"] for node in graph.root.values()
+    ]
+
+
+def test_resolve_text_encoders_records_default_for_diffusion_model():
+    models = ClientModels()
+    models.checkpoints = {
+        "model.safetensors": CheckpointInfo(
+            "model.safetensors", Arch.flux2_4b, FileFormat.diffusion
+        )
+    }
+    models.resources = {
+        ResourceId(ResourceKind.text_encoder, Arch.flux2_4b, "qwen_3_4b").string: (
+            "default-qwen.safetensors"
+        )
+    }
+
+    result = workflow.resolve_text_encoders(
+        CheckpointInput("model.safetensors"), Arch.flux2_4b, models
+    )
+
+    assert result == {"qwen_3_4b": "default-qwen.safetensors"}
+
+
+def test_resolve_text_encoders_prefers_style_override():
+    models = ClientModels()
+    models.checkpoints = {
+        "model.safetensors": CheckpointInfo(
+            "model.safetensors", Arch.flux2_4b, FileFormat.diffusion
+        )
+    }
+    models.resources = {
+        ResourceId(ResourceKind.text_encoder, Arch.flux2_4b, "qwen_3_4b").string: (
+            "default-qwen.safetensors"
+        )
+    }
+
+    result = workflow.resolve_text_encoders(
+        CheckpointInput(
+            "model.safetensors", text_encoders={"qwen_3_4b": "override-qwen.safetensors"}
+        ),
+        Arch.flux2_4b,
+        models,
+    )
+
+    assert result == {"qwen_3_4b": "override-qwen.safetensors"}
+
+
+def test_resolve_text_encoders_omits_checkpoint_embedded_clip():
+    models = ClientModels()
+    models.checkpoints = {
+        "model.safetensors": CheckpointInfo(
+            "model.safetensors", Arch.sdxl, FileFormat.checkpoint
+        )
+    }
+    models.resources = {
+        ResourceId(ResourceKind.text_encoder, Arch.sdxl, "clip_l").string: "clip-l.safetensors",
+        ResourceId(ResourceKind.text_encoder, Arch.sdxl, "clip_g").string: "clip-g.safetensors",
+    }
+
+    result = workflow.resolve_text_encoders(CheckpointInput("model.safetensors"), Arch.sdxl, models)
+
+    assert result == {}
 
 
 @pytest.mark.parametrize("extent", [Extent(256, 256), Extent(800, 800), Extent(512, 1024)])

@@ -24,7 +24,9 @@ class ControlLayer(QObject, ObservableProperties):
 
     mode = Property(ControlMode.reference, persist=True, setter="set_mode")
     layer_id = Property(QUuid(), persist=True)
+    enabled = Property(True, persist=True)
     preset_value = Property(2, persist=True, setter="set_preset_value")
+    post_strength_percent = Property(70, persist=True, setter="set_post_strength_percent")
     strength = Property(50, persist=True)
     start = Property(0.0, persist=True)
     end = Property(1.0, persist=True)
@@ -38,7 +40,9 @@ class ControlLayer(QObject, ObservableProperties):
 
     mode_changed = pyqtSignal(ControlMode)
     layer_id_changed = pyqtSignal(QUuid)
+    enabled_changed = pyqtSignal(bool)
     preset_value_changed = pyqtSignal(int)
+    post_strength_percent_changed = pyqtSignal(int)
     strength_changed = pyqtSignal(int)
     start_changed = pyqtSignal(float)
     end_changed = pyqtSignal(float)
@@ -89,10 +93,19 @@ class ControlLayer(QObject, ObservableProperties):
             self.preset_value_changed.emit(value)
             self._set_values_from_preset()
 
+    def set_post_strength_percent(self, value: int):
+        value = max(0, min(100, int(value)))
+        if value != self.post_strength_percent:
+            self._post_strength_percent = value
+            self.post_strength_percent_changed.emit(value)
+            self.modified.emit(self, "post_strength_percent")
+
     def _set_values_from_preset(self):
         params = ControlPresets.instance().interpolate(
             self.mode, self._model.arch, self.preset_value / self.max_preset_value
         )
+        if self.mode.is_post_processing:
+            self.post_strength_percent = round(params.strength * 100)
         self.strength = int(params.strength * self.strength_multiplier)
         self.start, self.end = params.range
 
@@ -132,7 +145,11 @@ class ControlLayer(QObject, ObservableProperties):
             else:
                 image = Image.scale(image, self.clip_vision_extent)
 
-        strength = self.strength / self.strength_multiplier
+        strength = (
+            self.post_strength_percent / 100
+            if self.mode.is_post_processing
+            else self.strength / self.strength_multiplier
+        )
         return ControlInput(self.mode, image, strength, (self.start, self.end))
 
     def generate(self):
@@ -143,6 +160,7 @@ class ControlLayer(QObject, ObservableProperties):
         from .root import root
 
         is_supported = True
+        self.has_range = self.mode.has_timestep_range
         if client := root.connection.client_if_connected:
             models = client.models.for_arch(self._model.arch)
 
@@ -191,7 +209,7 @@ class ControlLayer(QObject, ObservableProperties):
                         self.error_text = _("Not supported for") + f" {models.arch.value}"
                     is_supported = False
 
-            if self._index >= client.features.max_control_layers:
+            if not self.mode.is_post_processing and self._index >= client.features.max_control_layers:
                 self.error_text = _("Too many control layers")
                 is_supported = False
 
@@ -253,9 +271,9 @@ class ControlLayerList(QObject):
             c.index = i
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
-        for layer in (c for c in self._layers if not c.is_supported):
+        for layer in (c for c in self._layers if not c.is_supported and c.enabled):
             log.warning(f"Trying to use control layer {layer.mode.name}: {layer.error_text}")
-        return [c.to_api(bounds, time) for c in self._layers if c.is_supported]
+        return [c.to_api(bounds, time) for c in self._layers if c.is_supported and c.enabled]
 
     def _update_last_mode(self, mode: ControlMode):
         self._last_mode = mode
@@ -390,6 +408,8 @@ control_mode_text = {
     ControlMode.composition: _("Composition"),
     ControlMode.face: _("Face"),
     ControlMode.universal: _("Universal"),
+    ControlMode.color_match: _("Color Match"),
+    ControlMode.light_map: _("Light Map"),
     ControlMode.scribble: _("Scribble"),
     ControlMode.line_art: _("Line Art"),
     ControlMode.soft_edge: _("Soft Edge"),
@@ -402,6 +422,109 @@ control_mode_text = {
     ControlMode.stencil: _("Stencil"),
     ControlMode.hands: _("Hands"),
 }
+
+
+control_mode_tooltips = {
+    ControlMode.reference: _(
+        "Uses the layer as a visual reference through IP-Adapter or Redux.\n"
+        "Affects: subject identity, colors, materials, and the overall look.\n"
+        "Best when the result should resemble the image without locking every edge."
+    ),
+    ControlMode.style: _(
+        "Transfers the visual style from the layer through IP-Adapter.\n"
+        "Affects: color palette, lighting mood, medium, texture, and rendering style.\n"
+        "Best when you want the prompt composition but the reference image's look."
+    ),
+    ControlMode.composition: _(
+        "Uses the layer as a composition reference through IP-Adapter.\n"
+        "Affects: layout, framing, camera angle, object placement, and broad shapes.\n"
+        "Best when pose and arrangement matter more than exact texture or identity."
+    ),
+    ControlMode.face: _(
+        "Uses face ID guidance from the layer through IP-Adapter FaceID.\n"
+        "Affects: facial identity and key facial features.\n"
+        "Best with a clear face; it does not strongly control clothing, pose, or background."
+    ),
+    ControlMode.inpaint: _(
+        "Internal inpaint control for masked edits.\n"
+        "Affects: masked regions and their connection to the surrounding image.\n"
+        "Normally created by the edit workflow rather than selected manually."
+    ),
+    ControlMode.universal: _(
+        "Internal union ControlNet mode used when a universal control model is installed.\n"
+        "Affects: the same structure as the selected visible control type.\n"
+        "Normally selected automatically by the workflow."
+    ),
+    ControlMode.color_match: _(
+        "Matches the generated image colors to this layer after sampling.\n"
+        "Affects: color balance, saturation, and overall palette without changing structure.\n"
+        "Best for preventing flat or dull results while preserving the generated details."
+    ),
+    ControlMode.light_map: _(
+        "Screen-blends bright areas from this layer after sampling.\n"
+        "Affects: highlights, glow, colored light, and broad light placement without changing structure.\n"
+        "Best with a dark layer containing painted or preserved highlight areas."
+    ),
+    ControlMode.scribble: _(
+        "Uses a rough sketch or generated scribble map as structure guidance.\n"
+        "Affects: major contours, placement, and simple shapes.\n"
+        "Best for loose drawings where the model should invent the final details."
+    ),
+    ControlMode.line_art: _(
+        "Uses clean line art as structure guidance.\n"
+        "Affects: outlines, silhouettes, object boundaries, and shape placement.\n"
+        "Best for coloring or realistic translation of line drawings."
+    ),
+    ControlMode.soft_edge: _(
+        "Uses soft edge detection as structure guidance.\n"
+        "Affects: object boundaries and visible forms with more flexibility than Canny.\n"
+        "Best when you want structure without forcing every high-contrast edge."
+    ),
+    ControlMode.canny_edge: _(
+        "Uses a hard Canny edge map as structure guidance.\n"
+        "Affects: sharp edges, silhouettes, composition, and fine boundary placement.\n"
+        "Best for strict shape matching; high strength can over-constrain the result."
+    ),
+    ControlMode.depth: _(
+        "Uses a depth map as structure guidance.\n"
+        "Affects: foreground/background separation, camera perspective, and 3D layout.\n"
+        "Best for keeping scene geometry while allowing colors and details to change."
+    ),
+    ControlMode.normal: _(
+        "Uses a surface normal map as structure guidance.\n"
+        "Affects: surface direction, form, volume, and lighting-facing geometry.\n"
+        "Best for shaded or 3D-like sources where object form matters."
+    ),
+    ControlMode.pose: _(
+        "Uses an OpenPose skeleton as body guidance.\n"
+        "Affects: body pose, hands, face keypoints, and character placement.\n"
+        "Best for matching a character pose without copying clothing or identity."
+    ),
+    ControlMode.segmentation: _(
+        "Uses semantic regions as layout guidance.\n"
+        "Affects: where broad object categories and scene regions appear.\n"
+        "Best for controlling scene organization without preserving fine edges."
+    ),
+    ControlMode.blur: _(
+        "Uses tile/unblur control to preserve local image content while adding detail.\n"
+        "Affects: texture, colors, small structures, and restoration/upscale consistency.\n"
+        "Best for upscaling, sharpening, or regenerating detail from a blurry source."
+    ),
+    ControlMode.stencil: _(
+        "Uses a high-contrast stencil or pattern as strong structure guidance.\n"
+        "Affects: silhouettes, graphic shapes, readable patterns, and overall composition.\n"
+        "Best for QR/stencil-like layouts where the shape must survive generation."
+    ),
+    ControlMode.hands: _(
+        "Uses a hand-focused depth preprocessor as structure guidance.\n"
+        "Affects: hand shape, finger placement, and hand depth.\n"
+        "Best for hand correction or preserving hand placement from the source."
+    ),
+}
+
+
+def control_mode_tooltip(mode: ControlMode):
+    return control_mode_tooltips.get(mode, mode.text)
 
 
 def _lerp(a: float, b: float, t: float) -> float:

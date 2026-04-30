@@ -84,24 +84,43 @@ class JobParams:
         field_names = (f.name for f in fields(cls) if f.name != "seed")
         return all(getattr(a, name) == getattr(b, name) for name in field_names)
 
-    def set_style(self, style: Style, checkpoint: str):
+    def set_style(
+        self,
+        style: Style,
+        checkpoint: str,
+        text_encoders: dict[str, str] | None = None,
+        include_guidance: bool = True,
+    ):
         self.metadata["style"] = style.filename
         self.metadata["checkpoint"] = checkpoint
         self.metadata["sampler"] = style.sampler
         self.metadata["steps"] = style.sampler_steps
-        self.metadata["guidance"] = style.cfg_scale
+        if include_guidance:
+            self.metadata["guidance"] = style.cfg_scale
+        text_encoders = text_encoders if text_encoders is not None else style.text_encoders
+        text_encoders = {k: v for k, v in text_encoders.items() if v}
+        if text_encoders:
+            self.metadata["text_encoders"] = text_encoders
 
     def set_control(self, control: control.ControlLayerList):
-        self.metadata["control"] = [
-            {
+        self.metadata["control"] = []
+        for c in control:
+            if not (c.enabled and c.is_supported):
+                continue
+            strength = (
+                c.post_strength_percent / 100
+                if c.mode.is_post_processing
+                else c.strength / c.strength_multiplier
+            )
+            item = {
                 "mode": c.mode.text,
-                "strength": c.strength / c.strength_multiplier,
+                "strength": strength,
                 "image": c.layer.name,
-                "start": c.start,
-                "end": c.end,
             }
-            for c in control
-        ]
+            if c.mode.has_timestep_range:
+                item["start"] = c.start
+                item["end"] = c.end
+            self.metadata["control"].append(item)
 
     @property
     def prompt(self):

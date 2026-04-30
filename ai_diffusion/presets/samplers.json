@@ -109,5 +109,40 @@
         "steps": 20,
         "minimum_steps": 3,
         "cfg": 5.0
+    },
+    "RES4LYF Flux 2 - RES 2M": {
+        "sampler": "res_2m",
+        "scheduler": "flux2",
+        "steps": 20,
+        "minimum_steps": 3,
+        "cfg": 1.0
+    },
+    "RES4LYF Flux 2 - RES 3M": {
+        "sampler": "res_3m",
+        "scheduler": "flux2",
+        "steps": 20,
+        "minimum_steps": 3,
+        "cfg": 1.0
+    },
+    "RES4LYF Flux 2 - RES 2S": {
+        "sampler": "res_2s",
+        "scheduler": "flux2",
+        "steps": 12,
+        "minimum_steps": 3,
+        "cfg": 1.0
+    },
+    "RES4LYF Flux 2 - RES 3S": {
+        "sampler": "res_3s",
+        "scheduler": "flux2",
+        "steps": 10,
+        "minimum_steps": 3,
+        "cfg": 1.0
+    },
+    "RES4LYF Flux 2 - DEIS 2M": {
+        "sampler": "deis_2m",
+        "scheduler": "flux2",
+        "steps": 20,
+        "minimum_steps": 3,
+        "cfg": 1.0
     }
 }

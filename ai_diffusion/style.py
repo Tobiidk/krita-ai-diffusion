@@ -63,6 +63,12 @@ class StyleSettings:
         _("Model to encode and decode images. Commonly affects saturation and sharpness."),
     )
 
+    text_encoders = Setting(
+        _("Text Encoders"),
+        {},
+        _("Optional text encoder model overrides for diffusion-model checkpoints."),
+    )
+
     clip_skip = Setting(
         _("Clip Skip"),
         0,
@@ -126,6 +132,7 @@ class Style(QObject):
     style_prompt: str = StyleSettings.style_prompt.default
     negative_prompt: str = StyleSettings.negative_prompt.default
     vae: str = StyleSettings.vae.default
+    text_encoders: dict[str, str] = StyleSettings.text_encoders.default
     clip_skip: int = StyleSettings.clip_skip.default
     v_prediction_zsnr: bool = StyleSettings.v_prediction_zsnr.default
     rescale_cfg: float = StyleSettings.rescale_cfg.default
@@ -145,6 +152,7 @@ class Style(QObject):
         super().__init__()
         super().__setattr__("filepath", filepath)
         super().__setattr__("loras", [])
+        super().__setattr__("text_encoders", {})
 
     def __setattr__(self, name: str, value: Any):
         current = getattr(self, name)
@@ -221,6 +229,7 @@ class Style(QObject):
         return CheckpointInput(
             checkpoint=self.preferred_checkpoint(available_checkpoints),
             vae=self.vae,
+            text_encoders={k: v for k, v in self.text_encoders.items() if v},
             clip_skip=self.clip_skip,
             v_prediction_zsnr=self.v_prediction_zsnr,
             rescale_cfg=self.rescale_cfg,

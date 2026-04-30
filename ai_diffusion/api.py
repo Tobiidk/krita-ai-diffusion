@@ -2,7 +2,7 @@ import math
 from copy import copy
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from enum import Enum
-from types import GenericAlias, UnionType
+from types import UnionType
 from typing import Any, get_args, get_origin
 
 from .image import Bounds, Extent, Image, ImageCollection
@@ -59,6 +59,7 @@ class CheckpointInput:
     checkpoint: str
     version: Arch = Arch.sd15
     vae: str = ""
+    text_encoders: dict[str, str] = field(default_factory=dict)
     loras: list[LoraInput] = field(default_factory=list)
     clip_skip: int = 0
     v_prediction_zsnr: bool = False
@@ -349,6 +350,16 @@ class Deserializer:
         return self._value(field_type, value)
 
     def _value(self, cls, value):
+        origin = get_origin(cls)
+        if origin is list:
+            return [self._value(get_args(cls)[0], v) for v in value]
+        elif origin is tuple:
+            return tuple(value)
+        elif origin is dict:
+            return value
+        elif not isinstance(cls, type):
+            return value
+
         if is_dataclass(cls):
             return self._object(cls, value)
         elif issubclass(cls, Enum):
@@ -357,10 +368,6 @@ class Deserializer:
             return self._images[value]
         elif issubclass(cls, tuple):
             return cls(*value)
-        elif isinstance(cls, GenericAlias) and issubclass(get_origin(cls), tuple):
-            return tuple(value)
-        elif isinstance(cls, GenericAlias) and issubclass(get_origin(cls), list):
-            return [self._value(get_args(cls)[0], v) for v in value]
         else:
             return value
 
