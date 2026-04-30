@@ -1,4 +1,4 @@
-# Krita AI Diffusion - Tobii UI Tweaks Fork
+# Krita AI Diffusion - UI Tweaks Fork
 
 This fork is a working branch of
 [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion) focused on
@@ -11,7 +11,7 @@ after restarting Krita.
 
 ## Current Branch
 
-- Remote: `https://github.com/Tobiidk/krita-ai-diffusion.git`
+- Remote: `origin`
 - Branch: `ui-tweaks`
 - Baseline project: Krita plugin using ComfyUI as the backend.
 - Main test target: Flux 2 Klein editing/generation workflows.
