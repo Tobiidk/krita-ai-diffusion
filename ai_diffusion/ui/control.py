@@ -205,6 +205,7 @@ class ControlWidget(QWidget):
             control.preset_value_changed.connect(self._update_preset_slider),
             control.post_strength_percent_changed.connect(self._update_preset_slider),
             control.strength_changed.connect(self._update_strength),
+            control.strength_changed.connect(self._update_preset_slider),
             control.start_changed.connect(self._update_range),
             control.end_changed.connect(self._update_range),
             control.has_active_job_changed.connect(self._update_job_active),
@@ -219,6 +220,8 @@ class ControlWidget(QWidget):
             self.mode_select.currentIndexChanged.connect(self._update_mode_tooltip),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
             root.active_model.style_changed.connect(self._update_visibility),
+            root.active_model.style_changed.connect(self._update_preset_slider),
+            root.active_model.style_changed.connect(self._update_custom_values),
         ]
 
     def disconnect_all(self):
@@ -258,24 +261,32 @@ class ControlWidget(QWidget):
         is_small = self.width() < 420
         is_pose = self._control.mode is ControlMode.pose
         is_edit = root.active_model.arch.supports_edit
-        has_strength_controls = not is_edit or self._control.mode.is_post_processing
-        has_advanced_controls = not is_edit and not self._control.mode.is_post_processing
+        has_edit_reference_strength = self._has_edit_reference_strength()
+        has_strength_controls = (
+            not is_edit or self._control.mode.is_post_processing or has_edit_reference_strength
+        )
+        has_advanced_controls = (
+            not self._control.mode.is_post_processing
+            and (not is_edit or has_edit_reference_strength)
+        )
 
         def controls():
             self.layer_select.setVisible(self._control.is_supported)
             self.preset_slider.setVisible(self._control.is_supported and has_strength_controls)
+            has_preset_label = self._control.mode.is_post_processing or has_edit_reference_strength
             self.preset_value_label.setVisible(
-                self._control.is_supported and self._control.mode.is_post_processing
+                self._control.is_supported and has_preset_label
             )
             self.expand_button.setVisible(self._control.is_supported and has_advanced_controls)
             self.generate_button.setVisible(self._control.can_generate and is_small)
             self.generate_tool_button.setVisible(self._control.can_generate and not is_small)
             self.add_pose_button.setVisible(is_pose and is_small)
             self.add_pose_tool_button.setVisible(is_pose and not is_small)
-            self.range_label.setVisible(self._control.has_range)
-            self.range_slider.setVisible(self._control.has_range)
-            self.range_start_label.setVisible(self._control.has_range)
-            self.range_end_label.setVisible(self._control.has_range)
+            has_range = self._control.has_range and not has_edit_reference_strength
+            self.range_label.setVisible(has_range)
+            self.range_slider.setVisible(has_range)
+            self.range_start_label.setVisible(has_range)
+            self.range_end_label.setVisible(has_range)
             if not self._control.is_supported or not has_advanced_controls:
                 self.expand_button.setChecked(False)
 
@@ -312,6 +323,20 @@ class ControlWidget(QWidget):
                         value=self._control.post_strength_percent
                     )
                 )
+            elif self._has_edit_reference_strength():
+                value = self._edit_reference_slider_value()
+                percent = value * 5
+                self.preset_slider.setRange(0, 20)
+                self.preset_slider.setSingleStep(1)
+                self.preset_slider.setPageStep(2)
+                self.preset_slider.setTickInterval(2)
+                self.preset_slider.setValue(value)
+                self.preset_value_label.setText(f"{percent}%")
+                self.preset_slider.setToolTip(
+                    _(
+                        "Reference strength: {value}%. Lower values blur the image before using it as an edit-model reference"
+                    ).format(value=percent)
+                )
             else:
                 self.preset_slider.setRange(0, self._control.max_preset_value)
                 self.preset_slider.setSingleStep(1)
@@ -326,6 +351,11 @@ class ControlWidget(QWidget):
     def _set_preset_slider_value(self, value: int):
         if self._control.mode.is_post_processing:
             self._control.post_strength_percent = value * 5
+        elif self._has_edit_reference_strength():
+            percent = value * 5
+            self._control.strength = round(
+                percent / 100 * ControlLayer.strength_multiplier
+            )
         else:
             self._control.preset_value = value
 
@@ -341,7 +371,9 @@ class ControlWidget(QWidget):
 
     def _update_custom_values(self):
         self.preset_slider.setEnabled(
-            self._control.mode.is_post_processing or not self._control.use_custom_strength
+            self._control.mode.is_post_processing
+            or self._has_edit_reference_strength()
+            or not self._control.use_custom_strength
         )
         self.strength_slider.setEnabled(self._control.use_custom_strength)
         self.range_slider.setEnabled(self._control.use_custom_strength)
@@ -357,6 +389,19 @@ class ControlWidget(QWidget):
 
     def _toggle_extended(self):
         self.extended_widget.setVisible(self.expand_button.isChecked())
+
+    def _edit_reference_slider_value(self):
+        percent = round(
+            self._control.strength / ControlLayer.strength_multiplier * 100
+        )
+        return max(0, min(20, round(percent / 5)))
+
+    def _has_edit_reference_strength(self):
+        arch = root.active_model.arch
+        mode = self._control.mode
+        return arch.supports_edit and (
+            mode.is_ip_adapter or mode.can_substitute_instruction(arch)
+        )
 
     def _set_error(self, error: str):
         parts = error.split("[", 2)

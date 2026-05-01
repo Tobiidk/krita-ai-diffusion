@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from copy import copy
+from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -41,6 +41,12 @@ class StyleSettings:
         _("LoRA"),
         [],
         _("Extensions to the checkpoint which expand its range based on additional training"),
+    )
+
+    lora_presets = Setting(
+        _("LoRA Presets"),
+        {},
+        _("Named LoRA combinations saved for this style preset"),
     )
 
     style_prompt = Setting(
@@ -129,6 +135,7 @@ class Style(QObject):
     architecture: Arch = StyleSettings.architecture.default
     checkpoints: list[str] = StyleSettings.checkpoints.default
     loras: list[dict[str, str | float | bool]]
+    lora_presets: dict[str, list[dict[str, str | float | bool]]]
     style_prompt: str = StyleSettings.style_prompt.default
     negative_prompt: str = StyleSettings.negative_prompt.default
     vae: str = StyleSettings.vae.default
@@ -152,6 +159,7 @@ class Style(QObject):
         super().__init__()
         super().__setattr__("filepath", filepath)
         super().__setattr__("loras", [])
+        super().__setattr__("lora_presets", {})
         super().__setattr__("text_encoders", {})
 
     def __setattr__(self, name: str, value: Any):
@@ -297,7 +305,7 @@ class Styles(QObject):
         if copy_from:
             for name, setting in StyleSettings.__dict__.items():
                 if isinstance(setting, Setting):
-                    setattr(new_style, name, copy(getattr(copy_from, name)))
+                    setattr(new_style, name, deepcopy(getattr(copy_from, name)))
             new_style.name = f"{copy_from.name} (Copy)"
         self._list.append(new_style)
         new_style.save()
@@ -367,6 +375,10 @@ class SamplerPreset(NamedTuple):
     cfg_schedule: str = ""
     cfg_start: float = 1.0
     cfg_end: float = 1.0
+
+    @property
+    def default_guidance(self):
+        return self.cfg_end if self.cfg_schedule else self.cfg
 
 
 class SamplerPresets:

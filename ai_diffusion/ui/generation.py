@@ -141,6 +141,23 @@ class ImageCompareDialog(QDialog):
         self._slider.valueChanged.connect(self._label.set_position)
         layout.addWidget(self._label)
         layout.addWidget(self._slider)
+        self._resize_to_image(left, right)
+
+    def _resize_to_image(self, left: Image, right: Image):
+        image_width = max(left.width, right.width)
+        image_height = max(left.height, right.height)
+        screen = QGuiApplication.screenAt(self.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(max(420, image_width), max(320, image_height))
+            return
+
+        available = screen.availableGeometry()
+        chrome = QSize(36, 96)
+        max_size = available.size() - QSize(40, 60)
+        target = QSize(image_width, image_height) + chrome
+        target.setWidth(max(420, min(target.width(), max_size.width())))
+        target.setHeight(max(320, min(target.height(), max_size.height())))
+        self.resize(target)
 
 
 class HistoryWidget(QListWidget):

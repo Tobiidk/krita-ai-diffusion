@@ -33,8 +33,10 @@ from PyQt5.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QScrollArea,
     QVBoxLayout,
     QPlainTextEdit,
@@ -66,8 +68,9 @@ from ..model import (
 )
 from ..properties import Bind, Binding, bind, bind_combo
 from ..root import root
-from ..settings import Settings, settings
-from ..style import Style, Styles, sort_recent_styles
+from ..server import ServerState
+from ..settings import ServerMode, Settings, settings
+from ..style import SamplerPresets, Style, Styles, sort_recent_styles
 from ..text import (
     char16_index_to_str_index,
     char16_len,
@@ -85,6 +88,7 @@ from ..workflow import apply_denoise_strength, snap_to_percent
 from .. import eventloop
 from . import actions, theme
 from .autocomplete import PromptAutoComplete
+from .settings_widgets import NoWheelComboBox
 from .switch import SwitchWidget
 from .theme import SignalBlocker
 
@@ -852,6 +856,20 @@ class StyleParamsWidget(QWidget):
         layout.setSpacing(2)
         self.setLayout(layout)
 
+        # Sampler preset selector for the current quality/live context.
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        self._preset_label = QLabel(_("Preset") + ":", self)
+        self._preset_label.setFixedWidth(64)
+        self._preset_combo = NoWheelComboBox(self)
+        self._preset_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
+        )
+        self._preset_combo.activated.connect(self._preset_activated)
+        preset_row.addWidget(self._preset_label)
+        preset_row.addWidget(self._preset_combo, 1)
+        layout.addLayout(preset_row)
+
         # Steps slider
         steps_row = QHBoxLayout()
         steps_row.setContentsMargins(0, 0, 0, 0)
@@ -885,7 +903,7 @@ class StyleParamsWidget(QWidget):
         self._cfg_spin = QDoubleSpinBox(self)
         self._cfg_spin.setMinimum(1.0)
         self._cfg_spin.setMaximum(20.0)
-        self._cfg_spin.setSingleStep(0.5)
+        self._cfg_spin.setSingleStep(0.1)
         self._cfg_spin.setDecimals(1)
         self._cfg_spin.setFixedWidth(58)
         self._cfg_slider.valueChanged.connect(self._cfg_slider_moved)
@@ -912,8 +930,12 @@ class StyleParamsWidget(QWidget):
         """Refresh slider values from the current effective style and workspace."""
         if self._model is None:
             return
+        self._sync_preset_combo()
+        sampler_name = self._active_sampler_name()
         steps, cfg = self._model.effective_sampler_values()
-        supports_guidance = self._model.arch.supports_guidance_scale
+        supports_guidance = self._supports_guidance()
+        with SignalBlocker(self._preset_combo):
+            self._preset_combo.setCurrentText(sampler_name)
         for widget in self._cfg_widgets:
             widget.setVisible(supports_guidance)
         with SignalBlocker(self._steps_slider), SignalBlocker(self._steps_spin):
@@ -924,6 +946,63 @@ class StyleParamsWidget(QWidget):
         with SignalBlocker(self._cfg_slider), SignalBlocker(self._cfg_spin):
             self._cfg_slider.setValue(round(cfg * 10))
             self._cfg_spin.setValue(cfg)
+
+    def _sync_preset_combo(self):
+        names = SamplerPresets.instance().names()
+        current = [self._preset_combo.itemText(i) for i in range(self._preset_combo.count())]
+        if current == names:
+            return
+        with SignalBlocker(self._preset_combo):
+            self._preset_combo.clear()
+            self._preset_combo.addItems(names)
+
+    def _active_sampler_name(self):
+        assert self._model is not None
+        style = self._model.active_style
+        return style.live_sampler if self._model.is_live_mode else style.sampler
+
+    def _active_preset(self):
+        return SamplerPresets.instance()[self._active_sampler_name()]
+
+    def _supports_guidance(self):
+        if self._model is None:
+            return False
+        return self._model.arch.supports_guidance_scale or bool(
+            self._active_preset().cfg_schedule
+        )
+
+    def _preset_activated(self, index: int = -1):
+        if self._model is None:
+            return
+        name = self._preset_combo.currentText()
+        if not name:
+            return
+
+        style = self._model.active_style
+        is_live = self._model.is_live_mode
+        old_name = self._active_sampler_name()
+        if old_name == name:
+            return
+
+        old_preset = SamplerPresets.instance()[old_name]
+        new_preset = SamplerPresets.instance()[name]
+        _, current_cfg = self._model.effective_sampler_values()
+
+        if is_live:
+            style.live_sampler = name
+            if new_preset.cfg_schedule and (
+                not old_preset.cfg_schedule or current_cfg <= new_preset.cfg_start
+            ):
+                style.live_cfg_scale = new_preset.default_guidance
+        else:
+            style.sampler = name
+            if new_preset.cfg_schedule and (
+                not old_preset.cfg_schedule or current_cfg <= new_preset.cfg_start
+            ):
+                style.cfg_scale = new_preset.default_guidance
+
+        style.save()
+        self._read_from_style()
 
     def _steps_slider_moved(self, value: int):
         with SignalBlocker(self._steps_spin):
@@ -961,7 +1040,7 @@ class StyleParamsWidget(QWidget):
     def _write_cfg(self, value: float):
         if self._model is None:
             return
-        if not self._model.arch.supports_guidance_scale:
+        if not self._supports_guidance():
             return
         style = self._model.active_style
         if self._model.is_live_mode:
@@ -1131,8 +1210,31 @@ class LoraDockerPanel(QWidget):
         self._layout.setSpacing(2)
         self.setLayout(self._layout)
 
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(3)
         header = QLabel("<b>" + _("LoRAs") + "</b>", self)
-        self._layout.addWidget(header)
+        header_layout.addWidget(header)
+
+        self._preset_combo = NoWheelComboBox(self)
+        self._preset_combo.setToolTip(_("Apply a saved LoRA preset for this style"))
+        self._preset_combo.setMinimumWidth(90)
+        self._preset_combo.currentIndexChanged.connect(self._apply_lora_preset)
+        header_layout.addWidget(self._preset_combo, 1)
+
+        self._save_preset_button = QToolButton(self)
+        self._save_preset_button.setText("+")
+        self._save_preset_button.setToolTip(_("Save current LoRA settings as a preset"))
+        self._save_preset_button.clicked.connect(self._save_lora_preset)
+        header_layout.addWidget(self._save_preset_button)
+
+        self._delete_preset_button = QToolButton(self)
+        self._delete_preset_button.setText("-")
+        self._delete_preset_button.setToolTip(_("Delete selected LoRA preset"))
+        self._delete_preset_button.clicked.connect(self._delete_lora_preset)
+        header_layout.addWidget(self._delete_preset_button)
+
+        self._layout.addLayout(header_layout)
 
         # Scrollable container for LoRA items
         self._scroll_area = QScrollArea(self)
@@ -1179,6 +1281,7 @@ class LoraDockerPanel(QWidget):
             return
         style = self._model.active_style
         loras = style.loras
+        self._rebuild_preset_combo()
 
         # Hide all existing items first
         for item in self._lora_items:
@@ -1250,6 +1353,84 @@ class LoraDockerPanel(QWidget):
             style.save()
         finally:
             self._updating = False
+
+    def _rebuild_preset_combo(self, selected: str = ""):
+        if self._model is None:
+            return
+        style = self._model.active_style
+        presets = style.lora_presets if isinstance(style.lora_presets, dict) else {}
+        with SignalBlocker(self._preset_combo):
+            self._preset_combo.clear()
+            self._preset_combo.addItem(_("LoRA Preset"), "")
+            for name in sorted(presets, key=lambda text: text.lower()):
+                self._preset_combo.addItem(name, name)
+            index = self._preset_combo.findData(selected)
+            self._preset_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._delete_preset_button.setEnabled(bool(self._preset_combo.currentData()))
+
+    def _snapshot_loras(self):
+        if self._model is None:
+            return []
+        return [dict(lora) for lora in self._model.active_style.loras]
+
+    def _apply_lora_preset(self):
+        if self._model is None or self._updating:
+            return
+        name = self._preset_combo.currentData()
+        self._delete_preset_button.setEnabled(bool(name))
+        if not name:
+            return
+        style = self._model.active_style
+        presets = style.lora_presets if isinstance(style.lora_presets, dict) else {}
+        preset = presets.get(name)
+        if not isinstance(preset, list):
+            return
+        style.loras = [dict(lora) for lora in preset if isinstance(lora, dict)]
+        style.save()
+        self._rebuild()
+        self._rebuild_preset_combo(name)
+
+    def _save_lora_preset(self):
+        if self._model is None:
+            return
+        name, ok = QInputDialog.getText(
+            self,
+            _("Save LoRA Preset"),
+            _("Preset name:"),
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        style = self._model.active_style
+        presets = dict(style.lora_presets) if isinstance(style.lora_presets, dict) else {}
+        if name in presets:
+            reply = QMessageBox.question(
+                self,
+                _("Overwrite LoRA Preset"),
+                _("A LoRA preset with this name already exists. Overwrite it?"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        presets[name] = self._snapshot_loras()
+        style.lora_presets = presets
+        style.save()
+        self._rebuild_preset_combo(name)
+
+    def _delete_lora_preset(self):
+        if self._model is None:
+            return
+        name = self._preset_combo.currentData()
+        if not name:
+            return
+        style = self._model.active_style
+        presets = dict(style.lora_presets) if isinstance(style.lora_presets, dict) else {}
+        if name in presets:
+            del presets[name]
+            style.lora_presets = presets
+            style.save()
+        self._rebuild_preset_combo()
 
 
 class QuickStyleBar(QWidget):
@@ -1403,18 +1584,36 @@ class VramWidget(QWidget):
         self._free_button.setToolTip(_("Unload all models and free GPU memory"))
         self._free_button.clicked.connect(self._free_memory)
 
+        self._panic_button = QPushButton(_("Panic"), self)
+        self._panic_button.setMaximumHeight(20)
+        self._panic_button.setToolTip(
+            _("Cancel queued jobs, restart the managed ComfyUI server, and reconnect")
+        )
+        self._panic_button.clicked.connect(self._panic_restart)
+
         layout.addWidget(self._label, 1)
         layout.addWidget(self._free_button)
+        layout.addWidget(self._panic_button)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_stats)
         self._poll_timer.start(5000)  # poll every 5 seconds
 
         root.connection.state_changed.connect(self._on_connection_changed)
+        settings.changed.connect(self._handle_settings_changed)
+        self._update_panic_button()
 
     def _on_connection_changed(self):
         if root.connection.client_if_connected:
             self._poll_stats()
+        self._update_panic_button()
+
+    def _handle_settings_changed(self, key: str, _value: object):
+        if key == "server_mode":
+            self._update_panic_button()
+
+    def _update_panic_button(self):
+        self._panic_button.setEnabled(settings.server_mode is ServerMode.managed)
 
     def _poll_stats(self):
         client = root.connection.client_if_connected
@@ -1453,6 +1652,37 @@ class VramWidget(QWidget):
             await self._fetch_stats(client)
         except Exception:
             pass
+
+    def _panic_restart(self):
+        if settings.server_mode is not ServerMode.managed:
+            return
+        self._free_button.setEnabled(False)
+        self._panic_button.setEnabled(False)
+        self._label.setText(_("VRAM") + ": " + _("restarting..."))
+        eventloop.run(self._do_panic_restart())
+
+    def _cancel_local_jobs(self):
+        for model in root.models:
+            for job in list(model.jobs):
+                if job.state in [JobState.queued, JobState.executing]:
+                    model.jobs.notify_cancelled(job)
+
+    async def _do_panic_restart(self):
+        try:
+            self._cancel_local_jobs()
+            if root.connection.state is not ConnectionState.disconnected:
+                await root.connection.disconnect()
+            if root.server.state is not ServerState.stopped:
+                await root.server.force_stop()
+            url = await root.server.start()
+            await root.connection._connect(url, ServerMode.managed)
+            if client := root.connection.client_if_connected:
+                await self._fetch_stats(client)
+        except Exception:
+            self._label.setText(_("VRAM") + ": " + _("restart failed"))
+        finally:
+            self._free_button.setEnabled(True)
+            self._update_panic_button()
 
 
 class LayerCountWidget(QWidget):

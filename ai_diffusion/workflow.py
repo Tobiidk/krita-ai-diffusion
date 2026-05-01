@@ -68,7 +68,7 @@ def sampling_from_style(style: Style, strength: float, is_live: bool):
         total_steps=max_steps,
         cfg_schedule=preset.cfg_schedule,
         cfg_scale_start=preset.cfg_start,
-        cfg_scale_end=preset.cfg_end,
+        cfg_scale_end=cfg if preset.cfg_schedule and cfg > preset.cfg_start else preset.cfg_end,
     )
     if strength < 1.0:
         result.total_steps, result.start_step = apply_denoise_strength(strength, max_steps)
@@ -477,7 +477,7 @@ class Conditioning:
 
     @staticmethod
     def from_input(i: ConditioningInput, sampling: SamplingInput | None):
-        has_negative = sampling and sampling.cfg_scale > 1
+        has_negative = sampling and (sampling.cfg_scale > 1 or bool(sampling.cfg_schedule))
         return Conditioning(
             TextPrompt(i.positive, i.language),
             TextPrompt(i.negative, i.language) if has_negative else None,
@@ -792,8 +792,23 @@ def apply_reference_conditioning(
     if not arch.supports_edit:
         return prompt
 
-    extra_input = (c.image for c in cond.all_control if c.mode.is_ip_adapter)
-    extra_images = [i.load(w) for i in extra_input]
+    def soften_reference(control: Control):
+        strength = min(max(control.strength, 0.0), 1.0)
+        if strength <= 0.0:
+            return None
+
+        image = control.image.load(w)
+        if strength >= 1.0:
+            return image
+
+        blur_radius = round((1.0 - strength) * 31)
+        return w.image_blur(image, blur_radius, sigma=1.0)
+
+    extra_images = [
+        image
+        for control in (c for c in cond.all_control if c.mode.is_ip_adapter)
+        if (image := soften_reference(control)) is not None
+    ]
 
     def add_ref(prompt: ConditioningOutput, latent: Output):
         return ConditioningOutput(
@@ -803,7 +818,7 @@ def apply_reference_conditioning(
 
     match arch:
         case Arch.flux2_4b | Arch.flux2_9b | Arch.qwen_e_p:
-            if cond.edit_reference and input_latent:
+            if cond.edit_reference and input_latent and not (arch.is_flux2 and extra_images):
                 prompt = add_ref(prompt, input_latent)
             for extra_image in extra_images:
                 latent = vae_encode(w, vae, extra_image, tiled_vae)

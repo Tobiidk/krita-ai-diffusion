@@ -638,6 +638,7 @@ class SamplerWidget(QWidget):
     def __init__(self, prefix: str, title: str, parent):
         super().__init__(parent)
         self.prefix = prefix
+        self._arch_supports_guidance = True
 
         expander = ExpanderButton(title, self)
 
@@ -645,6 +646,7 @@ class SamplerWidget(QWidget):
         self._preset.addItems(SamplerPresets.instance().names())
         self._preset.setMinimumWidth(230)
         self._preset.currentIndexChanged.connect(self._select_preset)
+        self._selected_preset_name = self._preset.currentText()
 
         header_layout = QHBoxLayout()
         header_layout.addWidget(expander)
@@ -692,8 +694,12 @@ class SamplerWidget(QWidget):
 
     def _select_preset(self, index: int):
         preset = self.preset
-        self._steps.value = preset.steps
-        self._cfg.value = preset.cfg
+        old_preset = SamplerPresets.instance()[self._selected_preset_name]
+        self._selected_preset_name = self._preset.currentText()
+        if preset.cfg_schedule and (
+            not old_preset.cfg_schedule or self._cfg.value <= preset.cfg_start
+        ):
+            self._cfg.value = preset.default_guidance
         self._update_info()
         self.notify_changed()
 
@@ -708,6 +714,7 @@ class SamplerWidget(QWidget):
         if preset.lora:
             text += f" +LoRA '{preset.lora}'"
         self._sampler_info.setText(text)
+        self._update_guidance_visibility()
 
     def _open_user_presets(self):
         path = SamplerPresets.instance().write_stub()
@@ -719,10 +726,16 @@ class SamplerWidget(QWidget):
         self.value_changed.emit()
 
     def set_guidance_visible(self, visible: bool):
-        self._cfg.setVisible(visible)
+        self._arch_supports_guidance = visible
+        self._update_guidance_visibility()
+
+    def _update_guidance_visibility(self):
+        self._cfg.setVisible(self._arch_supports_guidance or bool(self.preset.cfg_schedule))
 
     def read(self, style: Style):
-        self._preset.setCurrentText(getattr(style, f"{self.prefix}sampler"))
+        with SignalBlocker(self._preset):
+            self._preset.setCurrentText(getattr(style, f"{self.prefix}sampler"))
+        self._selected_preset_name = self._preset.currentText()
         self._steps.value = getattr(style, f"{self.prefix}sampler_steps")
         self._cfg.value = getattr(style, f"{self.prefix}cfg_scale")
         self._update_info()

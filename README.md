@@ -33,15 +33,16 @@ after restarting Krita.
 - Negative prompt remains disabled for Flux 2 in the current default path,
   because the current Flux 2 BasicGuider flow does not use CFG-style negative
   conditioning meaningfully.
-- The next planned experiment is an optional Flux 2 Scheduled CFGGuider path via
-  ComfyUI Inspire Pack.
+- Added an optional Flux 2 Scheduled CFGGuider path via ComfyUI Inspire Pack.
 
 ### Guidance, Steps, and Denoise
 
-- Added sidebar sampler controls for steps and guidance where the active model
-  architecture actually supports them.
-- Kept Flux 2 guidance hidden in the sidebar because regular CFG was not wired
-  to an effective Flux 2 node.
+- Added sidebar sampler preset, steps, and guidance controls for the active
+  quality/live context.
+- Sidebar and style-settings sampler switches preserve the current step count
+  instead of reloading the preset default every time.
+- Kept regular Flux 2 guidance hidden, but Scheduled CFG presets expose the
+  guidance slider as the target `to_cfg` value.
 - Reworked denoise handling so edit denoise is not just a misleading bundled
   steps display.
 - History metadata now records denoise, actual steps, and total steps when
@@ -52,6 +53,13 @@ after restarting Krita.
 - Added compact LoRA quick toggles in the generation sidebar.
 - LoRA entries can be enabled/disabled directly from the sidebar.
 - LoRA strength can be adjusted directly from the sidebar.
+- Added style-local LoRA presets in the sidebar:
+  - Save the current LoRA order, enabled states, strengths, display names, and
+    descriptions as a named preset.
+  - Reapply a saved LoRA preset from a dropdown.
+  - Delete saved LoRA presets.
+  - Presets are stored inside the active style JSON under `lora_presets`, not
+    globally across all styles.
 - Sidebar LoRA area uses a compact two-column layout.
 - Sidebar LoRA area has a draggable height handle and remembers the chosen
   visible row count.
@@ -81,6 +89,29 @@ Example LoRA style entry:
 }
 ```
 
+Example style-local LoRA preset entry:
+
+```json
+{
+    "lora_presets": {
+        "Baseline Realism": [
+            {
+                "name": "AnimeToReal-Klein.safetensors",
+                "strength": 0.7,
+                "enabled": true,
+                "display_name": "Anime to Real",
+                "description": "Primary domain-shift LoRA."
+            },
+            {
+                "name": "UltraReal-Klein-v4.safetensors",
+                "strength": 0.5,
+                "enabled": true
+            }
+        ]
+    }
+}
+```
+
 ### Quick Generation Styles
 
 - Added quick generation style buttons in the sidebar.
@@ -100,6 +131,11 @@ Example LoRA style entry:
   - Color Match: helps preserve color and saturation from the source.
   - Light Map: screen-blends a highlight/light map back into the output.
 - Color Match and Light Map expose percent strength in 5% steps.
+- Flux 2 edit-model reference controls expose an experimental strength slider:
+  lower values blur Reference/Composition-style control images before they are
+  encoded as reference latents.
+- Flux 2 edit-model Reference/Composition strength uses a visible 0-100%
+  control in 5% steps with the current percent shown beside the slider.
 - Added icons and tests for the new control modes.
 - Control layers and their settings are now saved/restored with `.kra` project
   persistence for the edit/root control layer path.
@@ -130,6 +166,13 @@ Example LoRA style entry:
 
 - Added optional upscale noise injection controls.
 - Added VRAM display and a Free VRAM button in the sidebar.
+- Added a managed-server Panic button next to Free VRAM:
+  - Cancels active/queued plugin jobs locally.
+  - Disconnects from ComfyUI.
+  - Force-stops the managed ComfyUI process.
+  - Starts the managed server again and reconnects.
+  - The button is only enabled for the plugin-managed local server, not for
+    external or cloud backends.
 - Added progress detail plumbing from ComfyUI messages.
 - Added several robustness patches around ComfyUI/Nunchaku startup warnings and
   Windows logging issues encountered during testing.
@@ -149,6 +192,8 @@ Scheduled CFG is implemented as an opt-in Flux 2 sampler preset experiment.
 - Scheduled CFG requires ComfyUI Inspire Pack.
 - If Inspire Pack is missing, the plugin reports a clear error when a Scheduled
   CFG preset is used.
+- Scheduled CFG keeps a separate empty negative conditioning branch for Flux 2,
+  even though the normal Flux 2 negative prompt UI remains disabled.
 - The workflow routes sampling through:
 
 ```text
@@ -159,8 +204,7 @@ positive + negative/empty conditioning + sigmas
 
 - Added presets:
   - `Flux 2 - Euler Scheduled CFG`
-  - `RES4LYF Flux 2 - RES 2M Scheduled CFG`
-- The initial values are:
+- The default values are:
 
 ```text
 from_cfg: 1.0
@@ -168,11 +212,11 @@ to_cfg: 1.5
 schedule: exp
 ```
 
-This is compatible with RES4LYF in the workflow graph because RES4LYF is the
-sampler input and Scheduled CFG is the guider input to `SamplerCustomAdvanced`.
-If a RES4LYF scheduled preset errors, try the Euler scheduled preset first;
-there is an [upstream Inspire Pack report][inspire-res4lyf-scheduled-cfg]
-for `res_2s` with Scheduled CFGGuider.
+RES4LYF scheduled CFG presets are intentionally not exposed. RES4LYF samplers
+can make additional model calls after the scheduled sigma list is exhausted,
+which currently trips Inspire Pack's `ScheduledCFGGuider` with `KeyError: 9`.
+There is an [upstream Inspire Pack report][inspire-res4lyf-scheduled-cfg]
+for a similar RES4LYF + Scheduled CFGGuider failure.
 
 [inspire-res4lyf-scheduled-cfg]: https://github.com/ltdrdata/ComfyUI-Inspire-Pack/issues/252
 
@@ -184,7 +228,7 @@ so most UI and workflow edits are not hot-reloaded.
 Useful checks:
 
 ```powershell
-python -m py_compile ai_diffusion\ui\widget.py ai_diffusion\ui\style.py ai_diffusion\ui\settings_widgets.py
+python -m py_compile ai_diffusion\style.py ai_diffusion\server.py ai_diffusion\workflow.py ai_diffusion\ui\widget.py ai_diffusion\ui\style.py ai_diffusion\ui\control.py ai_diffusion\ui\generation.py ai_diffusion\ui\settings_widgets.py
 python -m pytest tests\test_workflow.py tests\test_comfy_workflow.py tests\test_api.py tests\test_settings.py tests\test_jobs.py -q
 git diff --check
 ```

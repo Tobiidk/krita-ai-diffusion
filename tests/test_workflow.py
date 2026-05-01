@@ -103,12 +103,43 @@ def test_sampling_reads_scheduled_cfg_from_sampler_preset():
     style = Style(Path("flux2.json"))
     style.sampler = "Flux 2 - Euler Scheduled CFG"
     style.sampler_steps = 8
+    style.cfg_scale = 1.0
 
     sampling = workflow.sampling_from_style(style, strength=1.0, is_live=False)
 
     assert sampling.cfg_schedule == "exp"
     assert sampling.cfg_scale_start == 1.0
     assert sampling.cfg_scale_end == 1.5
+
+
+def test_sampling_uses_style_guidance_for_scheduled_cfg_target():
+    style = Style(Path("flux2.json"))
+    style.sampler = "Flux 2 - Euler Scheduled CFG"
+    style.sampler_steps = 8
+    style.cfg_scale = 2.0
+
+    sampling = workflow.sampling_from_style(style, strength=1.0, is_live=False)
+
+    assert sampling.cfg_scale_start == 1.0
+    assert sampling.cfg_scale_end == 2.0
+
+
+def test_scheduled_cfg_keeps_negative_conditioning_branch():
+    sampling = SamplingInput(
+        sampler="euler",
+        scheduler="flux2",
+        cfg_scale=1.0,
+        total_steps=8,
+        cfg_schedule="exp",
+        cfg_scale_start=1.0,
+        cfg_scale_end=1.5,
+    )
+
+    cond = workflow.Conditioning.from_input(
+        ConditioningInput(positive="change the background", negative=""), sampling
+    )
+
+    assert cond.negative is not None
 
 
 def default_style(client: Client, arch=Arch.sd15):
@@ -490,6 +521,37 @@ def test_light_map_control_adds_screen_blend_node():
     assert "ControlNetApplyAdvanced" not in [
         node["class_type"] for node in graph.root.values()
     ]
+
+
+def test_flux2_reference_control_strength_softens_reference_latent():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    style.sampler_steps = 4
+    cond = ConditioningInput(
+        "test",
+        control=[ControlInput(ControlMode.reference, Image.create(Extent(512, 512)), 0.4)],
+    )
+
+    work = workflow.prepare(
+        WorkflowKind.generate,
+        Extent(512, 512),
+        cond,
+        style,
+        1,
+        models,
+        FileLibrary(FileCollection(), FileCollection()),
+        PerformanceSettings(batch_size=1),
+    )
+    graph = workflow.create(work, models)
+    blur = next(node for node in graph.root.values() if node["class_type"] == "ImageBlur")
+
+    assert blur["inputs"]["blur_radius"] == 19
+    assert blur["inputs"]["sigma"] == 1.0
+    assert "ReferenceLatent" in [node["class_type"] for node in graph.root.values()]
 
 
 def test_resolve_text_encoders_records_default_for_diffusion_model():

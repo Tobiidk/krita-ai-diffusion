@@ -582,6 +582,31 @@ class Server:
         except TimeoutError:
             log.warning("Server did not terminate in time")
 
+    async def force_stop(self):
+        if self._process is None:
+            self.state = ServerState.stopped
+            return
+
+        process = self._process
+        log.warning("Force-stopping server")
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except TimeoutError:
+            log.warning("Server did not terminate; killing process")
+            process.kill()
+            await asyncio.wait_for(process.wait(), timeout=3)
+        finally:
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+            self._process = None
+            self._task = None
+            self.state = ServerState.stopped
+
     def terminate(self):
         try:
             if self._process is not None:

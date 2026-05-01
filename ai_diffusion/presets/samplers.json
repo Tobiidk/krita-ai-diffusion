@@ -127,16 +127,6 @@
         "minimum_steps": 3,
         "cfg": 1.0
     },
-    "RES4LYF Flux 2 - RES 2M Scheduled CFG": {
-        "sampler": "res_2m",
-        "scheduler": "flux2",
-        "steps": 20,
-        "minimum_steps": 3,
-        "cfg": 1.0,
-        "cfg_schedule": "exp",
-        "cfg_start": 1.0,
-        "cfg_end": 1.5
-    },
     "RES4LYF Flux 2 - RES 3M": {
         "sampler": "res_3m",
         "scheduler": "flux2",

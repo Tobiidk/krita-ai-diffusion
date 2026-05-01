@@ -1129,6 +1129,11 @@ class ComfyWorkflow:
             blend_mode=mode,
         )
 
+    def image_blur(self, image: Output, radius: int, sigma=1.0):
+        if radius <= 0:
+            return image
+        return self.add("ImageBlur", 1, image=image, blur_radius=radius, sigma=sigma)
+
     def crop_mask(self, mask: Output, bounds: Bounds):
         return self.add(
             "CropMask",
