@@ -165,6 +165,7 @@ class ControlWidget(QWidget):
         self.strength_slider.setValue(control.strength)
         self.strength_slider.setSingleStep(1)
         self.strength_slider.setPageStep(10)
+        self.strength_slider.setTickInterval(5)
         self.strength_label = QLabel("1.0", self.extended_widget)
 
         self.range_label = QLabel(_("Range") + ":", self.extended_widget)
@@ -189,6 +190,7 @@ class ControlWidget(QWidget):
         self._update_visibility()
         self._update_mode_tooltip()
         self._update_preset_slider()
+        self._update_strength_slider()
         self._update_pose_utils()
         self._update_strength()
         self._update_range()
@@ -205,7 +207,7 @@ class ControlWidget(QWidget):
             control.preset_value_changed.connect(self._update_preset_slider),
             control.post_strength_percent_changed.connect(self._update_preset_slider),
             control.strength_changed.connect(self._update_strength),
-            control.strength_changed.connect(self._update_preset_slider),
+            control.strength_changed.connect(self._update_strength_slider),
             control.start_changed.connect(self._update_range),
             control.end_changed.connect(self._update_range),
             control.has_active_job_changed.connect(self._update_job_active),
@@ -216,11 +218,13 @@ class ControlWidget(QWidget):
             control.mode_changed.connect(self._update_visibility),
             control.mode_changed.connect(self._update_mode_tooltip),
             control.mode_changed.connect(self._update_preset_slider),
+            control.mode_changed.connect(self._update_strength_slider),
             control.mode_changed.connect(self._update_custom_values),
             self.mode_select.currentIndexChanged.connect(self._update_mode_tooltip),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
             root.active_model.style_changed.connect(self._update_visibility),
             root.active_model.style_changed.connect(self._update_preset_slider),
+            root.active_model.style_changed.connect(self._update_strength_slider),
             root.active_model.style_changed.connect(self._update_custom_values),
         ]
 
@@ -272,8 +276,12 @@ class ControlWidget(QWidget):
 
         def controls():
             self.layer_select.setVisible(self._control.is_supported)
-            self.preset_slider.setVisible(self._control.is_supported and has_strength_controls)
-            has_preset_label = self._control.mode.is_post_processing or has_edit_reference_strength
+            self.preset_slider.setVisible(
+                self._control.is_supported
+                and has_strength_controls
+                and not has_edit_reference_strength
+            )
+            has_preset_label = self._control.mode.is_post_processing
             self.preset_value_label.setVisible(
                 self._control.is_supported and has_preset_label
             )
@@ -323,20 +331,6 @@ class ControlWidget(QWidget):
                         value=self._control.post_strength_percent
                     )
                 )
-            elif self._has_edit_reference_strength():
-                value = self._edit_reference_slider_value()
-                percent = value * 5
-                self.preset_slider.setRange(0, 20)
-                self.preset_slider.setSingleStep(1)
-                self.preset_slider.setPageStep(2)
-                self.preset_slider.setTickInterval(2)
-                self.preset_slider.setValue(value)
-                self.preset_value_label.setText(f"{percent}%")
-                self.preset_slider.setToolTip(
-                    _(
-                        "Reference strength: {value}%. Lower values blur the image before using it as an edit-model reference"
-                    ).format(value=percent)
-                )
             else:
                 self.preset_slider.setRange(0, self._control.max_preset_value)
                 self.preset_slider.setSingleStep(1)
@@ -351,18 +345,47 @@ class ControlWidget(QWidget):
     def _set_preset_slider_value(self, value: int):
         if self._control.mode.is_post_processing:
             self._control.post_strength_percent = value * 5
-        elif self._has_edit_reference_strength():
-            percent = value * 5
-            self._control.strength = round(
-                percent / 100 * ControlLayer.strength_multiplier
-            )
         else:
             self._control.preset_value = value
 
+    def _update_strength_slider(self, *args):
+        if self._has_edit_reference_strength():
+            if not self._control.use_custom_strength:
+                self._control.reset_to_preset()
+            max_value = ControlLayer.strength_multiplier
+            if self._control.strength > max_value:
+                self._control.strength = max_value
+                return
+            with SignalBlocker(self.strength_slider):
+                self.strength_slider.setRange(0, max_value)
+                self.strength_slider.setSingleStep(1)
+                self.strength_slider.setPageStep(5)
+                self.strength_slider.setTickInterval(5)
+                self.strength_slider.setValue(self._control.strength)
+                self.strength_slider.setToolTip(
+                    _(
+                        "Reference strength: lower values blend the image toward a blurred copy before using it as an edit-model reference"
+                    )
+                )
+        else:
+            with SignalBlocker(self.strength_slider):
+                self.strength_slider.setRange(0, 75)
+                self.strength_slider.setSingleStep(1)
+                self.strength_slider.setPageStep(10)
+                self.strength_slider.setTickInterval(5)
+                self.strength_slider.setValue(self._control.strength)
+                self.strength_slider.setToolTip(
+                    _("Control strength: how much the layer affects the image")
+                )
+        self._update_strength()
+
     def _update_strength(self):
-        self.strength_label.setText(
-            f"{self._control.strength / ControlLayer.strength_multiplier:.2f}"
-        )
+        if self._has_edit_reference_strength():
+            self.strength_label.setText(f"{self._edit_reference_percent()}%")
+        else:
+            self.strength_label.setText(
+                f"{self._control.strength / ControlLayer.strength_multiplier:.2f}"
+            )
 
     def _update_job_active(self):
         self.generate_button.setEnabled(not self._control.has_active_job)
@@ -372,7 +395,6 @@ class ControlWidget(QWidget):
     def _update_custom_values(self):
         self.preset_slider.setEnabled(
             self._control.mode.is_post_processing
-            or self._has_edit_reference_strength()
             or not self._control.use_custom_strength
         )
         self.strength_slider.setEnabled(self._control.use_custom_strength)
@@ -390,18 +412,15 @@ class ControlWidget(QWidget):
     def _toggle_extended(self):
         self.extended_widget.setVisible(self.expand_button.isChecked())
 
-    def _edit_reference_slider_value(self):
-        percent = round(
-            self._control.strength / ControlLayer.strength_multiplier * 100
-        )
-        return max(0, min(20, round(percent / 5)))
+    def _edit_reference_percent(self):
+        return self._snap_edit_reference_percent(self._control.strength * 2)
+
+    def _snap_edit_reference_percent(self, value: int):
+        value = max(0, min(100, int(value)))
+        return min(100, ((value + 1) // 2) * 2)
 
     def _has_edit_reference_strength(self):
-        arch = root.active_model.arch
-        mode = self._control.mode
-        return arch.supports_edit and (
-            mode.is_ip_adapter or mode.can_substitute_instruction(arch)
-        )
+        return self._control.uses_edit_reference_strength
 
     def _set_error(self, error: str):
         parts = error.split("[", 2)

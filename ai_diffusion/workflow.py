@@ -21,6 +21,7 @@ from .api import (
     LoraInput,
     RegionInput,
     SamplingInput,
+    SeedVR2Input,
     UpscaleInput,
     WorkflowInput,
     WorkflowKind,
@@ -56,11 +57,29 @@ def generate_seed():
     return random.randint(0, 2**32 - 1)
 
 
-def sampling_from_style(style: Style, strength: float, is_live: bool):
-    sampler_name = style.live_sampler if is_live else style.sampler
-    cfg = style.live_cfg_scale if is_live else style.cfg_scale
-    _, max_steps = style.get_steps(is_live=is_live)
-    preset = SamplerPresets.instance()[sampler_name]
+def sampling_from_style(
+    style: Style,
+    strength: float,
+    is_live: bool,
+    sampler_preset: str = "",
+    keep_requested_steps: bool = True,
+):
+    style_sampler = style.live_sampler if is_live else style.sampler
+    sampler_name = sampler_preset or style_sampler
+    presets = SamplerPresets.instance()
+    try:
+        preset = presets[sampler_name]
+    except KeyError:
+        sampler_preset = ""
+        sampler_name = style_sampler
+        preset = presets[sampler_name]
+    if sampler_preset:
+        cfg = preset.default_guidance
+        max_steps = preset.steps
+        min_steps = min(preset.minimum_steps, max_steps)
+    else:
+        cfg = style.live_cfg_scale if is_live else style.cfg_scale
+        min_steps, max_steps = style.get_steps(is_live=is_live)
     result = SamplingInput(
         sampler=preset.sampler,
         scheduler=preset.scheduler,
@@ -69,14 +88,24 @@ def sampling_from_style(style: Style, strength: float, is_live: bool):
         cfg_schedule=preset.cfg_schedule,
         cfg_scale_start=preset.cfg_start,
         cfg_scale_end=cfg if preset.cfg_schedule and cfg > preset.cfg_start else preset.cfg_end,
+        nag_enabled=style.nag_enabled,
+        nag_scale=style.nag_scale,
+        nag_tau=style.nag_tau,
+        nag_alpha=style.nag_alpha,
+        nag_sigma_end=style.nag_sigma_end,
     )
     if strength < 1.0:
-        result.total_steps, result.start_step = apply_denoise_strength(strength, max_steps)
+        if keep_requested_steps:
+            result.total_steps, result.start_step = apply_denoise_strength(strength, max_steps)
+        else:
+            result.total_steps, result.start_step = apply_strength(strength, max_steps, min_steps)
     return result
 
 
 def apply_denoise_strength(strength: float, steps: int) -> tuple[int, int]:
     """Keep requested sampling steps while limiting denoise to a later sigma range."""
+    if strength <= 0.0:
+        return steps, steps
     if strength >= 1.0:
         return steps, 0
     strength = max(0.01, strength)
@@ -119,6 +148,11 @@ def _sampler_params(sampling: SamplingInput, extent: Extent, strength: float | N
         "cfg_schedule": sampling.cfg_schedule,
         "cfg_start": sampling.cfg_scale_start,
         "cfg_end": sampling.cfg_scale_end,
+        "nag_enabled": sampling.nag_enabled,
+        "nag_scale": sampling.nag_scale,
+        "nag_tau": sampling.nag_tau,
+        "nag_alpha": sampling.nag_alpha,
+        "nag_sigma_end": sampling.nag_sigma_end,
         "seed": sampling.seed,
         "extent": extent,
     }
@@ -477,7 +511,7 @@ class Conditioning:
 
     @staticmethod
     def from_input(i: ConditioningInput, sampling: SamplingInput | None):
-        has_negative = sampling and (sampling.cfg_scale > 1 or bool(sampling.cfg_schedule))
+        has_negative = sampling and sampling.uses_negative_conditioning
         return Conditioning(
             TextPrompt(i.positive, i.language),
             TextPrompt(i.negative, i.language) if has_negative else None,
@@ -801,8 +835,10 @@ def apply_reference_conditioning(
         if strength >= 1.0:
             return image
 
-        blur_radius = round((1.0 - strength) * 31)
-        return w.image_blur(image, blur_radius, sigma=1.0)
+        soften = 1.0 - strength
+        blur_radius = max(1, round(8 + soften * 24))
+        blurred = w.image_blur(image, blur_radius, sigma=1.0)
+        return w.image_blend(image, blurred, soften)
 
     extra_images = [
         image
@@ -818,7 +854,7 @@ def apply_reference_conditioning(
 
     match arch:
         case Arch.flux2_4b | Arch.flux2_9b | Arch.qwen_e_p:
-            if cond.edit_reference and input_latent and not (arch.is_flux2 and extra_images):
+            if cond.edit_reference and input_latent:
                 prompt = add_ref(prompt, input_latent)
             for extra_image in extra_images:
                 latent = vae_encode(w, vae, extra_image, tiled_vae)
@@ -1403,6 +1439,120 @@ def upscale_simple(w: ComfyWorkflow, image: Image, model: str, factor: float):
     return w
 
 
+def seedvr2_upscale(
+    w: ComfyWorkflow,
+    image: Image,
+    seedvr2: SeedVR2Input,
+    target_extent: Extent,
+):
+    in_image = w.load_image(image)
+    dit = w.seedvr2_load_dit_model(
+        seedvr2.dit_model,
+        seedvr2.device,
+        seedvr2.dit_offload_device,
+        seedvr2.blocks_to_swap,
+        seedvr2.swap_io_components,
+        seedvr2.attention_mode,
+    )
+    vae = w.seedvr2_load_vae_model(
+        seedvr2.vae_model,
+        seedvr2.device,
+        seedvr2.vae_offload_device,
+        seedvr2.vae_tiled,
+        seedvr2.vae_tile_size,
+        seedvr2.vae_tile_overlap,
+        seedvr2.vae_tiled,
+        seedvr2.vae_tile_size,
+        seedvr2.vae_tile_overlap,
+    )
+    out_image = w.seedvr2_upscale(
+        in_image,
+        dit,
+        vae,
+        seedvr2.seed,
+        target_extent.shortest_side,
+        seedvr2.color_correction,
+        seedvr2.input_noise_scale,
+        seedvr2.latent_noise_scale,
+        seedvr2.tensor_offload_device,
+        seedvr2.enable_debug,
+    )
+    if target_extent != image.extent:
+        out_image = w.scale_image(out_image, target_extent)
+    w.send_image(out_image)
+    return w
+
+
+def prepare_seedvr2_upscale(image: Image, seedvr2: SeedVR2Input, factor: float):
+    target_extent = (image.extent * factor).multiple_of(2)
+    i = WorkflowInput(WorkflowKind.seedvr2_upscale)
+    i.images = ImageInput(ExtentInput(image.extent, target_extent, target_extent, target_extent), image)
+    i.seedvr2 = seedvr2
+    return i
+
+
+def controls_with_default_image(control_layers: list[Control], default_image: Output):
+    return [
+        Control(
+            control.mode,
+            control.image if control.image else ImageOutput(default_image),
+            control.mask,
+            control.strength,
+            control.range,
+        )
+        for control in control_layers
+    ]
+
+
+def upscale_refine(
+    w: ComfyWorkflow,
+    image: Image,
+    extent: ExtentInput,
+    checkpoint: CheckpointInput,
+    cond: Conditioning,
+    sampling: SamplingInput,
+    upscale: UpscaleInput,
+    misc: MiscParams,
+    models: ModelDict,
+):
+    extent = ScaledExtent.from_input(extent)
+    in_image = w.load_image(image)
+    if upscale.model:
+        upscale_model = w.load_upscale_model(upscale.model)
+        in_image = w.upscale_image(upscale_model, in_image)
+    if extent.input != extent.initial:
+        in_image = w.scale_image(in_image, extent.initial)
+
+    if sampling.actual_steps <= 0:
+        out_image = apply_post_process_control(w, in_image, cond.all_control, extent.desired)
+        out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
+        out_image = scale_to_target(extent, w, out_image, models)
+        w.send_image(out_image)
+        return w
+
+    model, clip, vae = load_checkpoint_with_lora(w, checkpoint, models.all)
+    model = apply_ip_adapter(w, model, cond.control, models)
+    model, regions = apply_attention_mask(w, model, cond, clip, extent.initial)
+    model = apply_regional_ip_adapter(w, model, cond.regions, extent.initial, models)
+
+    latent = vae_encode(w, vae, in_image, checkpoint.tiled_vae)
+    latent_batch = w.batch_latent(latent, misc.batch_count)
+    prompt = encode_prompt(w, cond, clip, regions, in_image)
+    controls = controls_with_default_image(cond.all_control, in_image)
+    model, prompt = apply_control(w, model, prompt, controls, extent.desired, vae, models)
+    prompt = apply_reference_conditioning(
+        w, prompt, in_image, latent, cond, vae, models.arch, checkpoint.tiled_vae
+    )
+    sampler_params = _sampler_params(sampling, extent.desired)
+    sampler = w.sampler_custom_advanced(model, prompt, latent_batch, models.arch, **sampler_params)
+    out_image = vae_decode(w, vae, sampler, checkpoint.tiled_vae)
+    out_image = apply_post_process_control(w, out_image, cond.all_control, extent.desired)
+    out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
+    out_image = scale_to_target(extent, w, out_image, models)
+    w.send_image(out_image)
+    return w
+
+
 def upscale_tiled(
     w: ComfyWorkflow,
     image: Image,
@@ -1416,6 +1566,23 @@ def upscale_tiled(
 ):
     upscale_factor = extent.initial.width / extent.input.width
     multiple = resolution.diffusion_multiple
+    in_image = w.load_image(image)
+    if upscale.model:
+        upscale_model = w.load_upscale_model(upscale.model)
+        upscaled = w.upscale_image(upscale_model, in_image)
+    else:
+        upscaled = in_image
+    if extent.input != extent.initial:
+        upscaled = w.scale_image(upscaled, extent.initial)
+
+    if sampling.actual_steps <= 0:
+        out_image = apply_post_process_control(w, upscaled, cond.all_control, extent.initial)
+        out_image = w.nsfw_filter(out_image, sensitivity=misc.nsfw_filter)
+        if extent.initial != extent.target:
+            out_image = scale(extent.initial, extent.target, ScaleMode.resize, w, out_image, models)
+        w.send_image(out_image)
+        return w
+
     if upscale.tile_overlap >= 0:
         layout = TileLayout(extent.initial, extent.desired.width, upscale.tile_overlap, multiple)
     else:
@@ -1426,14 +1593,6 @@ def upscale_tiled(
     model, clip, vae = load_checkpoint_with_lora(w, checkpoint, models.all)
     model = apply_ip_adapter(w, model, cond.control, models)
 
-    in_image = w.load_image(image)
-    if upscale.model:
-        upscale_model = w.load_upscale_model(upscale.model)
-        upscaled = w.upscale_image(upscale_model, in_image)
-    else:
-        upscaled = in_image
-    if extent.input != extent.initial:
-        upscaled = w.scale_image(upscaled, extent.initial)
     tile_layout = w.create_tile_layout(
         upscaled, layout.min_size, layout.padding, layout.blending, multiple
     )
@@ -1680,7 +1839,7 @@ def prepare_prompts(
         meta["prompt_final"] = merge_prompt(cond.positive, cond.style, cond.language)
 
     cfg = style.live_cfg_scale if is_live else style.cfg_scale
-    if cfg == 1.0 or not arch.supports_cfg:
+    if not style.nag_enabled and (cfg == 1.0 or not arch.supports_cfg):
         cond.negative = ""  # CFG 1 does not use negative prompt
     else:
         cond.negative = strip_prompt_comments(cond.negative)
@@ -1726,6 +1885,7 @@ def prepare(
     inpaint: InpaintParams | None = None,
     upscale_factor: float = 1.0,
     upscale: UpscaleInput | None = None,
+    sampler_preset: str = "",
     is_live: bool = False,
     layer_count: int = 1,
 ) -> WorkflowInput:
@@ -1735,7 +1895,10 @@ def prepare(
     """
     i = WorkflowInput(kind)
     i.conditioning = cond
-    i.sampling = sampling_from_style(style, strength, is_live)
+    keep_requested_steps = kind not in (WorkflowKind.inpaint, WorkflowKind.refine_region)
+    i.sampling = sampling_from_style(
+        style, strength, is_live, sampler_preset, keep_requested_steps=keep_requested_steps
+    )
     i.sampling.seed = seed
     i.models = style.get_models(models.checkpoints)
     i.models.loras = unique(i.models.loras + (loras or []), key=lambda l: l.name)
@@ -1796,19 +1959,21 @@ def prepare(
         i.inpaint = InpaintParams.clamped(inpaint)
         downscale_all_control_images(i.conditioning, canvas.extent, i.images.extent.desired)
 
-    elif kind is WorkflowKind.upscale_tiled:
+    elif kind in (WorkflowKind.upscale_refine, WorkflowKind.upscale_tiled):
         assert isinstance(canvas, Image) and style
         target_extent = canvas.extent * upscale_factor
-        if style.preferred_resolution > 0:
-            tile_size = style.preferred_resolution
-        elif arch is Arch.sd15:
-            tile_size = 800
-        else:
-            tile_size = 1024
-        tile_size = max(tile_size, target_extent.longest_side // 12)  # max 12x12 tiles total
-        tile_size = multiple_of(tile_size - 128, resolution.diffusion_multiple)
-        tile_size = Extent(tile_size, tile_size)
         initial_extent = target_extent.multiple_of(resolution.diffusion_multiple)
+        tile_size = initial_extent
+        if kind is WorkflowKind.upscale_tiled:
+            if style.preferred_resolution > 0:
+                tile_size = style.preferred_resolution
+            elif arch is Arch.sd15:
+                tile_size = 800
+            else:
+                tile_size = 1024
+            tile_size = max(tile_size, target_extent.longest_side // 12)  # max 12x12 tiles total
+            tile_size = multiple_of(tile_size - 128, resolution.diffusion_multiple)
+            tile_size = Extent(tile_size, tile_size)
         extent = ExtentInput(canvas.extent, initial_extent, tile_size, target_extent)
         i.images = ImageInput(extent, canvas)
         assert upscale is not None
@@ -1913,6 +2078,20 @@ def create(i: WorkflowInput, models: ClientModels, comfy_mode=ComfyRunMode.serve
         )
     elif i.kind is WorkflowKind.upscale_simple:
         return upscale_simple(workflow, i.image, ensure(i.upscale).model, i.upscale_factor)
+    elif i.kind is WorkflowKind.seedvr2_upscale:
+        return seedvr2_upscale(workflow, i.image, ensure(i.seedvr2), i.extent.target)
+    elif i.kind is WorkflowKind.upscale_refine:
+        return upscale_refine(
+            workflow,
+            i.image,
+            i.extent,
+            ensure(i.models),
+            Conditioning.from_input(ensure(i.conditioning), i.sampling),
+            ensure(i.sampling),
+            ensure(i.upscale),
+            misc,
+            models.for_arch(ensure(i.models).version),
+        )
     elif i.kind is WorkflowKind.upscale_tiled:
         return upscale_tiled(
             workflow,

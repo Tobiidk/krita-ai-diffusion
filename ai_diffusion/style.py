@@ -63,6 +63,38 @@ class StyleSettings:
         _("Textual description of things to avoid in generated images."),
     )
 
+    nag_enabled = Setting(
+        _("NAG Negative Guidance"),
+        False,
+        _(
+            "Use ComfyUI-NAG custom nodes to steer away from the negative prompt when CFG guidance is not available."
+        ),
+    )
+
+    nag_scale = Setting(
+        _("NAG Scale"),
+        5.0,
+        _("Main NAG strength. Raise this first when tuning negative guidance."),
+    )
+
+    nag_tau = Setting(
+        _("NAG Tau"),
+        2.5,
+        _("NAG coherence rail. Higher values are stronger but riskier."),
+    )
+
+    nag_alpha = Setting(
+        _("NAG Alpha"),
+        0.25,
+        _("How much NAG attention is blended into the original attention."),
+    )
+
+    nag_sigma_end = Setting(
+        _("NAG Sigma End"),
+        0.75,
+        _("Stop applying NAG after this sigma. For Flux, 0.75 keeps NAG mostly to early steps."),
+    )
+
     vae = Setting(
         _("VAE"),
         "Checkpoint Default",
@@ -138,6 +170,11 @@ class Style(QObject):
     lora_presets: dict[str, list[dict[str, str | float | bool]]]
     style_prompt: str = StyleSettings.style_prompt.default
     negative_prompt: str = StyleSettings.negative_prompt.default
+    nag_enabled: bool = StyleSettings.nag_enabled.default
+    nag_scale: float = StyleSettings.nag_scale.default
+    nag_tau: float = StyleSettings.nag_tau.default
+    nag_alpha: float = StyleSettings.nag_alpha.default
+    nag_sigma_end: float = StyleSettings.nag_sigma_end.default
     vae: str = StyleSettings.vae.default
     text_encoders: dict[str, str] = StyleSettings.text_encoders.default
     clip_skip: int = StyleSettings.clip_skip.default

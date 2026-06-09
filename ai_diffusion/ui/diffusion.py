@@ -20,6 +20,7 @@ from ..root import root
 from ..server import Server, ServerState
 from ..settings import ServerMode, settings
 from ..updates import UpdateState
+from ..util import client_logger as log
 from . import theme
 from .animation import AnimationWidget
 from .custom_workflow import CustomWorkflowPlaceholder, CustomWorkflowWidget
@@ -275,6 +276,7 @@ class WelcomeWidget(QWidget):
 class ImageDiffusionWidget(DockWidget):
     def __init__(self):
         super().__init__()
+        log.info("Image diffusion dock initialized")
         self.setWindowTitle(_("AI Image Generation"))
         self._welcome = WelcomeWidget(root.server)
         self._generation = GenerationWidget()

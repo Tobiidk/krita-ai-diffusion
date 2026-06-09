@@ -106,8 +106,15 @@ class ControlLayer(QObject, ObservableProperties):
         )
         if self.mode.is_post_processing:
             self.post_strength_percent = round(params.strength * 100)
-        self.strength = int(params.strength * self.strength_multiplier)
+        self.strength = (
+            self.strength_multiplier
+            if self.uses_edit_reference_strength
+            else int(params.strength * self.strength_multiplier)
+        )
         self.start, self.end = params.range
+
+    def reset_to_preset(self):
+        self._set_values_from_preset()
 
     def set_use_custom_strength(self, value: bool):
         if value != self.use_custom_strength:
@@ -119,6 +126,12 @@ class ControlLayer(QObject, ObservableProperties):
     @property
     def index(self):
         return self._index
+
+    @property
+    def uses_edit_reference_strength(self):
+        return self._model.arch.supports_edit and (
+            self.mode.is_ip_adapter or self.mode.can_substitute_instruction(self._model.arch)
+        )
 
     @index.setter
     def index(self, index: int):

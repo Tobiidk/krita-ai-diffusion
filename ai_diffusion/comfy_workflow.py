@@ -348,6 +348,11 @@ class ComfyWorkflow:
         cfg_schedule="",
         cfg_start=1.0,
         cfg_end=1.0,
+        nag_enabled=False,
+        nag_scale=5.0,
+        nag_tau=2.5,
+        nag_alpha=0.25,
+        nag_sigma_end=0.75,
         seed=-1,
         extent: Extent | None = None,
     ):
@@ -359,7 +364,19 @@ class ComfyWorkflow:
 
         if arch.is_flux_like:
             positive = self.flux_guidance(cond.positive, cfg)
-            guider = self.basic_guider(model, positive)
+            if nag_enabled:
+                guider = self.nag_guider(
+                    model,
+                    positive,
+                    cond.negative,
+                    latent_image,
+                    nag_scale,
+                    nag_tau,
+                    nag_alpha,
+                    nag_sigma_end,
+                )
+            else:
+                guider = self.basic_guider(model, positive)
         elif cfg_schedule:
             guider, sigmas = self.scheduled_cfg_guider(
                 model,
@@ -370,7 +387,19 @@ class ComfyWorkflow:
                 schedule=cfg_schedule,
             )
         elif cfg == 1.0 or not arch.supports_cfg:
-            guider = self.basic_guider(model, cond.positive)
+            if nag_enabled:
+                guider = self.nag_guider(
+                    model,
+                    cond.positive,
+                    cond.negative,
+                    latent_image,
+                    nag_scale,
+                    nag_tau,
+                    nag_alpha,
+                    nag_sigma_end,
+                )
+            else:
+                guider = self.basic_guider(model, cond.positive)
         else:
             guider = self.cfg_guider(model, cond, cfg)
 
@@ -463,6 +492,34 @@ class ComfyWorkflow:
 
     def basic_guider(self, model: Output, positive: Output):
         return self.add("BasicGuider", 1, model=model, conditioning=positive)
+
+    def nag_guider(
+        self,
+        model: Output,
+        positive: Output,
+        nag_negative: Output,
+        latent_image: Output,
+        nag_scale=5.0,
+        nag_tau=2.5,
+        nag_alpha=0.25,
+        nag_sigma_end=0.75,
+    ):
+        if self.node_defs and "NAGGuider" not in self.node_defs:
+            raise RuntimeError(
+                "ComfyUI-NAG or ComfyUI-NAG-Extended is required for NAG negative guidance."
+            )
+        return self.add(
+            "NAGGuider",
+            1,
+            model=model,
+            conditioning=positive,
+            nag_negative=nag_negative,
+            nag_scale=nag_scale,
+            nag_tau=nag_tau,
+            nag_alpha=nag_alpha,
+            nag_sigma_end=nag_sigma_end,
+            latent_image=latent_image,
+        )
 
     def cfg_guider(self, model: Output, cond: ConditioningOutput, cfg=7.0):
         return self.add(
@@ -585,6 +642,96 @@ class ComfyWorkflow:
 
     def load_upscale_model(self, model_name: str):
         return self.add_cached("UpscaleModelLoader", 1, model_name=model_name)
+
+    def seedvr2_load_dit_model(
+        self,
+        model: str,
+        device: str,
+        offload_device: str,
+        blocks_to_swap: int,
+        swap_io_components: bool,
+        attention_mode: str,
+        cache_model: bool = False,
+    ):
+        if self.node_defs and "SeedVR2LoadDiTModel" not in self.node_defs:
+            raise RuntimeError("ComfyUI-SeedVR2_VideoUpscaler is required for SeedVR2 upscale.")
+        return self.add(
+            "SeedVR2LoadDiTModel",
+            1,
+            model=model,
+            device=device,
+            offload_device=offload_device,
+            cache_model=cache_model,
+            blocks_to_swap=blocks_to_swap,
+            swap_io_components=swap_io_components,
+            attention_mode=attention_mode,
+        )
+
+    def seedvr2_load_vae_model(
+        self,
+        model: str,
+        device: str,
+        offload_device: str,
+        encode_tiled: bool,
+        encode_tile_size: int,
+        encode_tile_overlap: int,
+        decode_tiled: bool,
+        decode_tile_size: int,
+        decode_tile_overlap: int,
+        cache_model: bool = False,
+    ):
+        if self.node_defs and "SeedVR2LoadVAEModel" not in self.node_defs:
+            raise RuntimeError("ComfyUI-SeedVR2_VideoUpscaler is required for SeedVR2 upscale.")
+        return self.add(
+            "SeedVR2LoadVAEModel",
+            1,
+            model=model,
+            device=device,
+            offload_device=offload_device,
+            cache_model=cache_model,
+            encode_tiled=encode_tiled,
+            encode_tile_size=encode_tile_size,
+            encode_tile_overlap=encode_tile_overlap,
+            decode_tiled=decode_tiled,
+            decode_tile_size=decode_tile_size,
+            decode_tile_overlap=decode_tile_overlap,
+            tile_debug="false",
+        )
+
+    def seedvr2_upscale(
+        self,
+        image: Output,
+        dit: Output,
+        vae: Output,
+        seed: int,
+        resolution: int,
+        color_correction: str,
+        input_noise_scale: float,
+        latent_noise_scale: float,
+        offload_device: str,
+        enable_debug: bool = False,
+    ):
+        if self.node_defs and "SeedVR2VideoUpscaler" not in self.node_defs:
+            raise RuntimeError("ComfyUI-SeedVR2_VideoUpscaler is required for SeedVR2 upscale.")
+        return self.add(
+            "SeedVR2VideoUpscaler",
+            1,
+            image=image,
+            dit=dit,
+            vae=vae,
+            seed=seed,
+            resolution=resolution,
+            max_resolution=0,
+            batch_size=1,
+            uniform_batch_size=False,
+            temporal_overlap=0,
+            prepend_frames=0,
+            color_correction=color_correction,
+            input_noise_scale=input_noise_scale,
+            latent_noise_scale=latent_noise_scale,
+            offload_device=offload_device,
+            enable_debug=enable_debug,
+        )
 
     def load_style_model(self, model_name: str):
         return self.add_cached("StyleModelLoader", 1, style_model_name=model_name)

@@ -97,6 +97,13 @@ class JobParams:
         self.metadata["steps"] = style.sampler_steps
         if include_guidance:
             self.metadata["guidance"] = style.cfg_scale
+        if style.nag_enabled:
+            self.metadata["nag"] = {
+                "scale": style.nag_scale,
+                "tau": style.nag_tau,
+                "alpha": style.nag_alpha,
+                "sigma_end": style.nag_sigma_end,
+            }
         text_encoders = text_encoders if text_encoders is not None else style.text_encoders
         text_encoders = {k: v for k, v in text_encoders.items() if v}
         if text_encoders:
@@ -117,7 +124,7 @@ class JobParams:
                 "strength": strength,
                 "image": c.layer.name,
             }
-            if c.mode.has_timestep_range:
+            if c.mode.has_timestep_range and not c.uses_edit_reference_strength:
                 item["start"] = c.start
                 item["end"] = c.end
             self.metadata["control"].append(item)

@@ -54,8 +54,12 @@ after restarting Krita.
 - LoRA entries can be enabled/disabled directly from the sidebar.
 - LoRA strength can be adjusted directly from the sidebar.
 - Added style-local LoRA presets in the sidebar:
-  - Save the current LoRA order, enabled states, strengths, display names, and
-    descriptions as a named preset.
+  - Add a new preset from the dropdown.
+  - Update the selected preset with the save button when its LoRA settings have
+    unsaved changes.
+  - Dirty presets show a trailing `*` in the dropdown.
+  - Presets store the current LoRA order, enabled states, strengths, display
+    names, and descriptions.
   - Reapply a saved LoRA preset from a dropdown.
   - Delete saved LoRA presets.
   - Presets are stored inside the active style JSON under `lora_presets`, not
@@ -122,6 +126,20 @@ Example style-local LoRA preset entry:
   squeezing the sidebar.
 - Quick style add/remove saves immediately.
 
+### NAG Negative Guidance
+
+- Added optional style-local NAG negative guidance settings for Flux-style
+  `SamplerCustomAdvanced` workflows:
+  - Enable/disable NAG per style preset.
+  - Tune `nag_scale`, `nag_tau`, `nag_alpha`, and `nag_sigma_end`.
+  - Preserve and encode the negative prompt for NAG even when CFG is 1.
+- The workflow intentionally uses the external `NAGGuider` custom node from
+  `ChenDarYen/ComfyUI-NAG` or `BigStationW/ComfyUI-NAG-Extended`, replacing the
+  normal `BasicGuider` path.
+- The built-in ComfyUI `NAGuidance` model node is not used.
+- If NAG is enabled and the external `NAGGuider` node is not installed, the
+  workflow raises a clear setup error instead of silently falling back.
+
 ### Control Layers
 
 - Added enabled/disabled toggles for control layers.
@@ -131,11 +149,15 @@ Example style-local LoRA preset entry:
   - Color Match: helps preserve color and saturation from the source.
   - Light Map: screen-blends a highlight/light map back into the output.
 - Color Match and Light Map expose percent strength in 5% steps.
-- Flux 2 edit-model reference controls expose an experimental strength slider:
-  lower values blur Reference/Composition-style control images before they are
-  encoded as reference latents.
-- Flux 2 edit-model Reference/Composition strength uses a visible 0-100%
-  control in 5% steps with the current percent shown beside the slider.
+- Flux 2 edit-model reference controls expose an experimental strength input:
+  lower values blend Reference/Composition-style control images toward a blurred
+  copy before they are encoded as reference latents.
+- Flux 2 edit-model Reference/Composition strength is hidden by default and uses
+  the advanced `Use custom values` strength slider when custom tuning is needed.
+  The slider label shows percent values in 2% steps, matching the internal
+  control precision.
+- Flux 2 edit-model Reference/Composition defaults and non-custom state always
+  use 100% reference strength.
 - Added icons and tests for the new control modes.
 - Control layers and their settings are now saved/restored with `.kra` project
   persistence for the edit/root control layer path.
@@ -152,7 +174,14 @@ Example style-local LoRA preset entry:
 - New images are marked as new in history until selected.
 - History grouping is less noisy: repeated generations with the same meaningful
   setup are grouped more compactly instead of splitting for every seed/tweak.
+- History group headers now show a compact run summary with denoise, sampler,
+  active LoRA count, and active control count.
+- History thumbnails show a local-time timestamp badge in the lower-right
+  corner.
 - Added image comparison for two selected history images.
+- Added metadata comparison for two selected history images, showing changed
+  fields side-by-side with color-coded differences and an option to reveal
+  unchanged fields.
 - Metadata includes style, model, sampler, LoRAs, text encoders, control layers,
   denoise, seed, and prompt details in a cleaner layout.
 
@@ -165,8 +194,22 @@ Example style-local LoRA preset entry:
 ### Upscale and Utility Additions
 
 - Added optional upscale noise injection controls.
+- Added Whole Image refine mode for prompt-guided upscale/refine passes without
+  splitting into tiles.
+- Upscale/refine denoise now supports the full 0-100% range; 0% skips the
+  diffusion refine pass, 100% runs full denoise.
+- Added a Flux 2 Upscale - Euler A CFG++ sampler preset using
+  `euler_ancestral_cfg_pp` with `sgm_uniform` scheduling.
+- Added optional LoRA controls for single-pass upscale/refine workflows.
+- Added a SeedVR2 Final Upscale section for running the external
+  `ComfyUI-SeedVR2_VideoUpscaler` node after an image/refine pass.
+  - Exposes DiT model, VAE model, device, DiT/VAE/tensor offload, attention
+    mode, color correction, input/latent noise, BlockSwap, Swap I/O, VAE
+    tiling, and debug logging.
+  - Uses SeedVR2 as a separate final upscale action instead of forcing it into
+    the normal Flux refine chain.
 - Added VRAM display and a Free VRAM button in the sidebar.
-- Added a managed-server Panic button next to Free VRAM:
+- Added a managed-server Restart Comfy button next to Free VRAM:
   - Cancels active/queued plugin jobs locally.
   - Disconnects from ComfyUI.
   - Force-stops the managed ComfyUI process.

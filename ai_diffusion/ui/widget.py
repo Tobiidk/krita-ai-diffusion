@@ -729,19 +729,19 @@ class StrengthSnapping:
 class StrengthSpinBox(QSpinBox):
     snapping: StrengthSnapping | None
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, minimum=1, maximum=100):
         super().__init__(parent)
         self.snapping = None
         # for manual input
-        self.setMinimum(1)
-        self.setMaximum(100)
+        self.setMinimum(minimum)
+        self.setMaximum(maximum)
 
     def stepBy(self, steps):
         value = max(self.minimum(), min(self.maximum(), self.value() + steps))
         if self.snapping is not None:
             # keep going until we hit a new snap point
             current_point = self.nearest_snap_point(self.value())
-            while self.nearest_snap_point(value) == current_point and value > 1:
+            while self.nearest_snap_point(value) == current_point and value > self.minimum():
                 value += 1 if steps > 0 else -1
             value = self.nearest_snap_point(value)
         self.setValue(value)
@@ -776,7 +776,9 @@ class StrengthWidget(QWidget):
         self._slider.setSingleStep(5)
         self._slider.valueChanged.connect(self.slider_changed)
 
-        self._input = StrengthSpinBox(self)
+        self._input = StrengthSpinBox(
+            self, minimum=slider_range[0], maximum=slider_range[1]
+        )
         self._input.setValue(self._value)
         if prefix:
             self._input.setPrefix((label or _("Strength")) + ": ")
@@ -837,6 +839,9 @@ class StrengthWidget(QWidget):
 
     def update_suffix(self):
         if not self._input.snapping or not settings.show_steps:
+            self._input.setSuffix("%")
+            return
+        if self._value <= 0:
             self._input.setSuffix("%")
             return
 
@@ -1190,6 +1195,7 @@ def _wrap_tooltip_text(text: str, width=56) -> str:
 class LoraDockerPanel(QWidget):
     """Compact LoRA panel for the main docker showing active style's LoRAs."""
 
+    _add_preset_data = "__add_lora_preset__"
     _model: Model | None = None
     _lora_items: list[LoraDockerItem]
     _columns = 2
@@ -1204,6 +1210,7 @@ class LoraDockerPanel(QWidget):
         self._visible_rows = self._clamp_visible_rows(settings.lora_docker_visible_rows)
         self._resize_start_y = 0
         self._resize_start_rows = self._visible_rows
+        self._last_preset_name = ""
 
         self._layout = QVBoxLayout()
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -1223,13 +1230,13 @@ class LoraDockerPanel(QWidget):
         header_layout.addWidget(self._preset_combo, 1)
 
         self._save_preset_button = QToolButton(self)
-        self._save_preset_button.setText("+")
-        self._save_preset_button.setToolTip(_("Save current LoRA settings as a preset"))
-        self._save_preset_button.clicked.connect(self._save_lora_preset)
+        self._save_preset_button.setIcon(theme.icon("save"))
+        self._save_preset_button.setToolTip(_("Update selected LoRA preset"))
+        self._save_preset_button.clicked.connect(self._update_lora_preset)
         header_layout.addWidget(self._save_preset_button)
 
         self._delete_preset_button = QToolButton(self)
-        self._delete_preset_button.setText("-")
+        self._delete_preset_button.setIcon(theme.icon("trash"))
         self._delete_preset_button.setToolTip(_("Delete selected LoRA preset"))
         self._delete_preset_button.clicked.connect(self._delete_lora_preset)
         header_layout.addWidget(self._delete_preset_button)
@@ -1353,10 +1360,13 @@ class LoraDockerPanel(QWidget):
             style.save()
         finally:
             self._updating = False
+        self._refresh_preset_dirty_state()
 
-    def _rebuild_preset_combo(self, selected: str = ""):
+    def _rebuild_preset_combo(self, selected: str | None = None):
         if self._model is None:
             return
+        if selected is None:
+            selected = self._last_preset_name
         style = self._model.active_style
         presets = style.lora_presets if isinstance(style.lora_presets, dict) else {}
         with SignalBlocker(self._preset_combo):
@@ -1364,20 +1374,100 @@ class LoraDockerPanel(QWidget):
             self._preset_combo.addItem(_("LoRA Preset"), "")
             for name in sorted(presets, key=lambda text: text.lower()):
                 self._preset_combo.addItem(name, name)
+            if presets:
+                self._preset_combo.insertSeparator(self._preset_combo.count())
+            self._preset_combo.addItem(_("Add new preset..."), self._add_preset_data)
             index = self._preset_combo.findData(selected)
             self._preset_combo.setCurrentIndex(index if index >= 0 else 0)
-        self._delete_preset_button.setEnabled(bool(self._preset_combo.currentData()))
+        self._last_preset_name = self._current_preset_name()
+        self._refresh_preset_dirty_state()
 
     def _snapshot_loras(self):
         if self._model is None:
             return []
         return [dict(lora) for lora in self._model.active_style.loras]
 
+    def _merge_lora_preset(self, preset: object):
+        current = self._snapshot_loras()
+        if not isinstance(preset, list):
+            return current
+        preset_by_name = {
+            str(lora.get("name", "")): dict(lora)
+            for lora in preset
+            if isinstance(lora, dict) and lora.get("name")
+        }
+        merged = []
+        for current_lora in current:
+            name = str(current_lora.get("name", ""))
+            if saved := preset_by_name.get(name):
+                item = dict(current_lora)
+                item.update(saved)
+                item["name"] = name
+                merged.append(item)
+            else:
+                merged.append(current_lora)
+        return merged
+
+    def _normalize_lora_snapshot(self, loras: object):
+        if not isinstance(loras, list):
+            return []
+        result = []
+        for lora in loras:
+            if not isinstance(lora, dict):
+                continue
+            item = dict(lora)
+            if "strength" in item:
+                try:
+                    item["strength"] = round(float(item["strength"]), 4)
+                except (TypeError, ValueError):
+                    pass
+            result.append(item)
+        return result
+
+    def _current_preset_name(self):
+        data = self._preset_combo.currentData()
+        return data if isinstance(data, str) and data not in ["", self._add_preset_data] else ""
+
+    def _has_lora_preset_changes(self, name: str):
+        if self._model is None or not name:
+            return False
+        style = self._model.active_style
+        presets = style.lora_presets if isinstance(style.lora_presets, dict) else {}
+        preset = presets.get(name)
+        return self._normalize_lora_snapshot(preset) != self._normalize_lora_snapshot(style.loras)
+
+    def _refresh_preset_dirty_state(self):
+        if self._model is None:
+            return
+        name = self._current_preset_name()
+        dirty = self._has_lora_preset_changes(name)
+        with SignalBlocker(self._preset_combo):
+            for index in range(self._preset_combo.count()):
+                data = self._preset_combo.itemData(index)
+                if not isinstance(data, str) or data in ["", self._add_preset_data]:
+                    continue
+                text = f"{data} *" if data == name and dirty else data
+                if self._preset_combo.itemText(index) != text:
+                    self._preset_combo.setItemText(index, text)
+        self._save_preset_button.setEnabled(bool(name) and dirty)
+        self._delete_preset_button.setEnabled(bool(name))
+        self._save_preset_button.setToolTip(
+            _("Update selected LoRA preset")
+            if dirty
+            else _("No changes to save for the selected LoRA preset")
+        )
+
     def _apply_lora_preset(self):
         if self._model is None or self._updating:
             return
-        name = self._preset_combo.currentData()
-        self._delete_preset_button.setEnabled(bool(name))
+        data = self._preset_combo.currentData()
+        if data == self._add_preset_data:
+            if not self._add_lora_preset():
+                self._rebuild_preset_combo(self._last_preset_name)
+            return
+        name = self._current_preset_name()
+        self._last_preset_name = name
+        self._refresh_preset_dirty_state()
         if not name:
             return
         style = self._model.active_style
@@ -1385,14 +1475,14 @@ class LoraDockerPanel(QWidget):
         preset = presets.get(name)
         if not isinstance(preset, list):
             return
-        style.loras = [dict(lora) for lora in preset if isinstance(lora, dict)]
+        style.loras = self._merge_lora_preset(preset)
         style.save()
         self._rebuild()
         self._rebuild_preset_combo(name)
 
-    def _save_lora_preset(self):
+    def _add_lora_preset(self):
         if self._model is None:
-            return
+            return False
         name, ok = QInputDialog.getText(
             self,
             _("Save LoRA Preset"),
@@ -1400,7 +1490,7 @@ class LoraDockerPanel(QWidget):
         )
         name = name.strip()
         if not ok or not name:
-            return
+            return False
         style = self._model.active_style
         presets = dict(style.lora_presets) if isinstance(style.lora_presets, dict) else {}
         if name in presets:
@@ -1412,16 +1502,34 @@ class LoraDockerPanel(QWidget):
                 QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
-                return
+                return False
         presets[name] = self._snapshot_loras()
         style.lora_presets = presets
         style.save()
+        self._last_preset_name = name
+        self._rebuild_preset_combo(name)
+        return True
+
+    def _update_lora_preset(self):
+        if self._model is None:
+            return
+        name = self._current_preset_name()
+        if not name:
+            return
+        style = self._model.active_style
+        presets = dict(style.lora_presets) if isinstance(style.lora_presets, dict) else {}
+        if name not in presets:
+            return
+        presets[name] = self._snapshot_loras()
+        style.lora_presets = presets
+        style.save()
+        self._last_preset_name = name
         self._rebuild_preset_combo(name)
 
     def _delete_lora_preset(self):
         if self._model is None:
             return
-        name = self._preset_combo.currentData()
+        name = self._current_preset_name()
         if not name:
             return
         style = self._model.active_style
@@ -1430,6 +1538,7 @@ class LoraDockerPanel(QWidget):
             del presets[name]
             style.lora_presets = presets
             style.save()
+        self._last_preset_name = ""
         self._rebuild_preset_combo()
 
 
@@ -1584,16 +1693,16 @@ class VramWidget(QWidget):
         self._free_button.setToolTip(_("Unload all models and free GPU memory"))
         self._free_button.clicked.connect(self._free_memory)
 
-        self._panic_button = QPushButton(_("Panic"), self)
-        self._panic_button.setMaximumHeight(20)
-        self._panic_button.setToolTip(
+        self._restart_button = QPushButton(_("Restart Comfy"), self)
+        self._restart_button.setMaximumHeight(20)
+        self._restart_button.setToolTip(
             _("Cancel queued jobs, restart the managed ComfyUI server, and reconnect")
         )
-        self._panic_button.clicked.connect(self._panic_restart)
+        self._restart_button.clicked.connect(self._restart_comfy)
 
         layout.addWidget(self._label, 1)
         layout.addWidget(self._free_button)
-        layout.addWidget(self._panic_button)
+        layout.addWidget(self._restart_button)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_stats)
@@ -1601,19 +1710,19 @@ class VramWidget(QWidget):
 
         root.connection.state_changed.connect(self._on_connection_changed)
         settings.changed.connect(self._handle_settings_changed)
-        self._update_panic_button()
+        self._update_restart_button()
 
     def _on_connection_changed(self):
         if root.connection.client_if_connected:
             self._poll_stats()
-        self._update_panic_button()
+        self._update_restart_button()
 
     def _handle_settings_changed(self, key: str, _value: object):
         if key == "server_mode":
-            self._update_panic_button()
+            self._update_restart_button()
 
-    def _update_panic_button(self):
-        self._panic_button.setEnabled(settings.server_mode is ServerMode.managed)
+    def _update_restart_button(self):
+        self._restart_button.setEnabled(settings.server_mode is ServerMode.managed)
 
     def _poll_stats(self):
         client = root.connection.client_if_connected
@@ -1653,13 +1762,13 @@ class VramWidget(QWidget):
         except Exception:
             pass
 
-    def _panic_restart(self):
+    def _restart_comfy(self):
         if settings.server_mode is not ServerMode.managed:
             return
         self._free_button.setEnabled(False)
-        self._panic_button.setEnabled(False)
+        self._restart_button.setEnabled(False)
         self._label.setText(_("VRAM") + ": " + _("restarting..."))
-        eventloop.run(self._do_panic_restart())
+        eventloop.run(self._do_restart_comfy())
 
     def _cancel_local_jobs(self):
         for model in root.models:
@@ -1667,7 +1776,7 @@ class VramWidget(QWidget):
                 if job.state in [JobState.queued, JobState.executing]:
                     model.jobs.notify_cancelled(job)
 
-    async def _do_panic_restart(self):
+    async def _do_restart_comfy(self):
         try:
             self._cancel_local_jobs()
             if root.connection.state is not ConnectionState.disconnected:
@@ -1682,7 +1791,7 @@ class VramWidget(QWidget):
             self._label.setText(_("VRAM") + ": " + _("restart failed"))
         finally:
             self._free_button.setEnabled(True)
-            self._update_panic_button()
+            self._update_restart_button()
 
 
 class LayerCountWidget(QWidget):

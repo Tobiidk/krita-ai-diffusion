@@ -1153,7 +1153,8 @@ class SettingsDialog(QDialog):
 
     @classmethod
     def instance(cls) -> SettingsDialog:
-        assert cls._instance is not None
+        if cls._instance is None:
+            cls._instance = SettingsDialog(root.server)
         return cls._instance
 
     def __init__(self, server: Server):

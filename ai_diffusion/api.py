@@ -20,6 +20,8 @@ class WorkflowKind(Enum):
     upscale_tiled = 5
     control_image = 6
     custom = 7
+    upscale_refine = 8
+    seedvr2_upscale = 9
 
 
 @dataclass
@@ -80,6 +82,15 @@ class SamplingInput:
     cfg_schedule: str = ""
     cfg_scale_start: float = 1.0
     cfg_scale_end: float = 1.0
+    nag_enabled: bool = False
+    nag_scale: float = 5.0
+    nag_tau: float = 2.5
+    nag_alpha: float = 0.25
+    nag_sigma_end: float = 0.75
+
+    @property
+    def uses_negative_conditioning(self):
+        return self.nag_enabled or self.cfg_scale > 1 or bool(self.cfg_schedule)
 
     @property
     def actual_steps(self):
@@ -171,6 +182,27 @@ class UpscaleInput:
 
 
 @dataclass
+class SeedVR2Input:
+    dit_model: str = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+    vae_model: str = "ema_vae_fp16.safetensors"
+    seed: int = 0
+    device: str = "cuda:0"
+    dit_offload_device: str = "none"
+    vae_offload_device: str = "none"
+    tensor_offload_device: str = "cpu"
+    blocks_to_swap: int = 0
+    swap_io_components: bool = False
+    attention_mode: str = "sdpa"
+    color_correction: str = "lab"
+    input_noise_scale: float = 0.0
+    latent_noise_scale: float = 0.0
+    vae_tiled: bool = True
+    vae_tile_size: int = 1024
+    vae_tile_overlap: int = 128
+    enable_debug: bool = False
+
+
+@dataclass
 class CustomStyleInput:
     models: CheckpointInput
     sampling: SamplingInput
@@ -198,6 +230,7 @@ class WorkflowInput:
     inpaint: InpaintParams | None = None
     crop_upscale_extent: Extent | None = None
     upscale: UpscaleInput | None = None
+    seedvr2: SeedVR2Input | None = None
     control_mode: ControlMode = ControlMode.reference
     batch_count: int = 1
     color_match: float = 0.0
@@ -255,6 +288,8 @@ class WorkflowInput:
             return 1
         if self.kind is WorkflowKind.upscale_simple:
             return 2
+        if self.kind is WorkflowKind.seedvr2_upscale:
+            return 4
 
         def cost_factor(batch: int, extent: Extent, steps: int):
             return batch * extent.pixel_count * math.sqrt(extent.pixel_count) * steps

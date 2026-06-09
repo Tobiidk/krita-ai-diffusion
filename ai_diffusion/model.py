@@ -27,6 +27,7 @@ from .api import (
     InpaintMode,
     InpaintParams,
     SamplingInput,
+    SeedVR2Input,
     UpscaleInput,
     WorkflowInput,
     WorkflowKind,
@@ -455,7 +456,11 @@ class Model(QObject, ObservableProperties):
         if self.arch.is_edit:
             sys_prompt = "Enhance image quality. Preserve original content."
 
-        if params.use_prompt and not dryrun:
+        upscale_prompt = params.prompt.strip()
+        if upscale_prompt and not dryrun:
+            conditioning, job_regions = ConditioningInput(upscale_prompt), []
+            conditioning.language = self.prompt_translation_language
+        elif params.use_prompt and not dryrun:
             conditioning, job_regions = process_regions(self.regions, bounds, min_coverage=0)
             conditioning.language = self.prompt_translation_language
             for region in job_regions:
@@ -469,8 +474,13 @@ class Model(QObject, ObservableProperties):
             conditioning.control.append(control)
 
         if params.use_diffusion:
+            workflow_kind = (
+                WorkflowKind.upscale_refine
+                if params.refine_mode is UpscaleRefineMode.whole_image
+                else WorkflowKind.upscale_tiled
+            )
             input = workflow.prepare(
-                WorkflowKind.upscale_tiled,
+                workflow_kind,
                 image,
                 conditioning,
                 self.style,
@@ -481,6 +491,7 @@ class Model(QObject, ObservableProperties):
                 strength=params.strength,
                 upscale_factor=params.factor,
                 upscale=params.upscale,
+                sampler_preset=params.sampler_preset,
             )
         else:
             input = workflow.prepare_upscale_simple(image, params.upscale.model, params.factor)
@@ -489,6 +500,47 @@ class Model(QObject, ObservableProperties):
         name = f"{target_bounds.width}x{target_bounds.height}"
         job_params = JobParams(target_bounds, name, seed=params.seed, regions=job_regions)
         return input, job_params
+
+    def _prepare_seedvr2_upscale_image(self, dryrun=False):
+        client = self._connection.client
+        extent = self._doc.extent
+        image = self._doc.get_image(Bounds(0, 0, *extent)) if not dryrun else DummyImage(extent)
+        params = self.upscale.seedvr2_params
+        nodes = client.models.node_inputs
+        if nodes and "SeedVR2VideoUpscaler" not in nodes:
+            raise RuntimeError(
+                _(
+                    "SeedVR2 custom nodes are not installed on the ComfyUI server. Install ComfyUI-SeedVR2_VideoUpscaler and restart the server."
+                )
+            )
+
+        input = workflow.prepare_seedvr2_upscale(
+            image,
+            params.seedvr2,
+            params.factor,
+        )
+        target_bounds = Bounds(0, 0, *params.target_extent)
+        name = f"SeedVR2 {target_bounds.width}x{target_bounds.height}"
+        job_params = JobParams(target_bounds, name, seed=params.seed)
+        return input, job_params
+
+    def seedvr2_upscale_image(self):
+        try:
+            self.clear_error()
+            inputs, job_params = self._prepare_seedvr2_upscale_image()
+            job = self.jobs.add(JobKind.upscaling, job_params)
+        except Exception as e:
+            self.report_error(util.log_error(e))
+            return
+
+        self.upscale.set_in_progress(True)
+        eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
+
+        self._doc.resize(job.params.bounds.extent)
+        if self.upscale.factor != 1.0:
+            self.upscale.factor = 1.0
+        else:
+            self.upscale.target_extent_changed.emit(self.upscale.target_extent)
 
     def upscale_image(self):
         factor_override = None
@@ -517,7 +569,10 @@ class Model(QObject, ObservableProperties):
         eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
 
         self._doc.resize(job.params.bounds.extent)
-        self.upscale.target_extent_changed.emit(self.upscale.target_extent)
+        if factor_override is None and self.upscale.factor != 1.0:
+            self.upscale.factor = 1.0
+        else:
+            self.upscale.target_extent_changed.emit(self.upscale.target_extent)
 
     def _inject_noise_layer(self, opacity_factor: float):
         """Create a paint layer with Gaussian noise at the given opacity (0-1)."""
@@ -1243,12 +1298,23 @@ class CustomInpaint(QObject, ObservableProperties):
 
 
 @dataclass(frozen=True)
+class SeedVR2Params:
+    seedvr2: SeedVR2Input
+    factor: float
+    target_extent: Extent
+    seed: int
+
+
+@dataclass(frozen=True)
 class UpscaleParams:
     upscale: UpscaleInput
     factor: float
     use_diffusion: bool
+    refine_mode: UpscaleRefineMode
     unblur_strength: float
     use_prompt: bool
+    prompt: str
+    sampler_preset: str
     strength: float
     target_extent: Extent
     seed: int
@@ -1259,29 +1325,68 @@ class TileOverlapMode(Enum):
     custom = 1
 
 
+class UpscaleRefineMode(Enum):
+    tiled = 0
+    whole_image = 1
+
+
 class UpscaleWorkspace(QObject, ObservableProperties):
     upscaler = Property("", persist=True)
     factor = Property(2.0, persist=True, setter="_set_factor")
     use_diffusion = Property(True, persist=True)
-    strength = Property(0.3, persist=True)
+    refine_mode = Property(UpscaleRefineMode.tiled, persist=True)
+    strength = Property(0.8, persist=True)
     unblur_strength = Property(0.5, persist=True)
     tile_overlap_mode = Property(TileOverlapMode.auto, persist=True)
     tile_overlap = Property(48, persist=True)
     use_prompt = Property(False, persist=True)
+    prompt = Property("", persist=True)
+    sampler_preset = Property("", persist=True)
     inject_noise = Property(False, persist=True)
     noise_strength = Property(0.1, persist=True)
+    seedvr2_dit_model = Property("seedvr2_ema_3b_fp8_e4m3fn.safetensors", persist=True)
+    seedvr2_vae_model = Property("ema_vae_fp16.safetensors", persist=True)
+    seedvr2_device = Property("cuda:0", persist=True)
+    seedvr2_dit_offload_device = Property("none", persist=True)
+    seedvr2_vae_offload_device = Property("none", persist=True)
+    seedvr2_tensor_offload_device = Property("cpu", persist=True)
+    seedvr2_blocks_to_swap = Property(0, persist=True)
+    seedvr2_swap_io_components = Property(False, persist=True)
+    seedvr2_attention_mode = Property("sdpa", persist=True)
+    seedvr2_color_correction = Property("lab", persist=True)
+    seedvr2_input_noise_scale = Property(0.0, persist=True)
+    seedvr2_latent_noise_scale = Property(0.0, persist=True)
+    seedvr2_vae_tiled = Property(True, persist=True)
+    seedvr2_enable_debug = Property(False, persist=True)
     can_generate = Property(True)
 
     upscaler_changed = pyqtSignal(str)
     factor_changed = pyqtSignal(float)
     use_diffusion_changed = pyqtSignal(bool)
+    refine_mode_changed = pyqtSignal(UpscaleRefineMode)
     strength_changed = pyqtSignal(float)
     unblur_strength_changed = pyqtSignal(float)
     tile_overlap_mode_changed = pyqtSignal(TileOverlapMode)
     tile_overlap_changed = pyqtSignal(int)
     use_prompt_changed = pyqtSignal(bool)
+    prompt_changed = pyqtSignal(str)
+    sampler_preset_changed = pyqtSignal(str)
     inject_noise_changed = pyqtSignal(bool)
     noise_strength_changed = pyqtSignal(float)
+    seedvr2_dit_model_changed = pyqtSignal(str)
+    seedvr2_vae_model_changed = pyqtSignal(str)
+    seedvr2_device_changed = pyqtSignal(str)
+    seedvr2_dit_offload_device_changed = pyqtSignal(str)
+    seedvr2_vae_offload_device_changed = pyqtSignal(str)
+    seedvr2_tensor_offload_device_changed = pyqtSignal(str)
+    seedvr2_blocks_to_swap_changed = pyqtSignal(int)
+    seedvr2_swap_io_components_changed = pyqtSignal(bool)
+    seedvr2_attention_mode_changed = pyqtSignal(str)
+    seedvr2_color_correction_changed = pyqtSignal(str)
+    seedvr2_input_noise_scale_changed = pyqtSignal(float)
+    seedvr2_latent_noise_scale_changed = pyqtSignal(float)
+    seedvr2_vae_tiled_changed = pyqtSignal(bool)
+    seedvr2_enable_debug_changed = pyqtSignal(bool)
     target_extent_changed = pyqtSignal(Extent)
     can_generate_changed = pyqtSignal(bool)
     modified = pyqtSignal(QObject, str)
@@ -1326,11 +1431,44 @@ class UpscaleWorkspace(QObject, ObservableProperties):
             upscale=UpscaleInput(self.upscaler, overlap),
             factor=self.factor,
             use_diffusion=self.use_diffusion,
+            refine_mode=self.refine_mode,
             unblur_strength=self.unblur_strength,
             use_prompt=self.use_prompt,
+            prompt=self.prompt,
+            sampler_preset=self.sampler_preset,
             strength=1.0 if model.arch.is_edit else self.strength,
             target_extent=self.target_extent,
             seed=model.seed if model.fixed_seed else workflow.generate_seed(),
+        )
+
+    @property
+    def seedvr2_params(self):
+        model = ensure(self._model())
+        dit_offload = self.seedvr2_dit_offload_device
+        if self.seedvr2_blocks_to_swap > 0 and dit_offload == "none":
+            dit_offload = "cpu"
+        seedvr2 = SeedVR2Input(
+            dit_model=self.seedvr2_dit_model,
+            vae_model=self.seedvr2_vae_model,
+            seed=model.seed if model.fixed_seed else workflow.generate_seed(),
+            device=self.seedvr2_device,
+            dit_offload_device=dit_offload,
+            vae_offload_device=self.seedvr2_vae_offload_device,
+            tensor_offload_device=self.seedvr2_tensor_offload_device,
+            blocks_to_swap=self.seedvr2_blocks_to_swap,
+            swap_io_components=self.seedvr2_swap_io_components,
+            attention_mode=self.seedvr2_attention_mode,
+            color_correction=self.seedvr2_color_correction,
+            input_noise_scale=self.seedvr2_input_noise_scale,
+            latent_noise_scale=self.seedvr2_latent_noise_scale,
+            vae_tiled=self.seedvr2_vae_tiled,
+            enable_debug=self.seedvr2_enable_debug,
+        )
+        return SeedVR2Params(
+            seedvr2=seedvr2,
+            factor=self.factor,
+            target_extent=self.target_extent,
+            seed=seedvr2.seed,
         )
 
 

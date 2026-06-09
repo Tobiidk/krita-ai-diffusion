@@ -34,6 +34,7 @@ from ..style import SamplerPresets, Style, Styles, StyleSettings
 from . import theme
 from .settings_widgets import (
     ComboBoxSetting,
+    DoubleSpinBoxSetting,
     ExpanderButton,
     LineEditSetting,
     NoWheelComboBox,
@@ -905,6 +906,23 @@ class StylePresets(SettingsTab):
         add("loras", LoraList(StyleSettings.loras, self))
         add("style_prompt", LineEditSetting(StyleSettings.style_prompt, self))
         add("negative_prompt", LineEditSetting(StyleSettings.negative_prompt, self))
+        add("nag_enabled", SwitchSetting(StyleSettings.nag_enabled, parent=self))
+        self._nag_scale = add(
+            "nag_scale",
+            DoubleSpinBoxSetting(StyleSettings.nag_scale, self, 0.0, 100.0, 0.5),
+        )
+        self._nag_tau = add(
+            "nag_tau",
+            DoubleSpinBoxSetting(StyleSettings.nag_tau, self, 1.0, 10.0, 0.1),
+        )
+        self._nag_alpha = add(
+            "nag_alpha",
+            DoubleSpinBoxSetting(StyleSettings.nag_alpha, self, 0.0, 1.0, 0.05),
+        )
+        self._nag_sigma_end = add(
+            "nag_sigma_end",
+            DoubleSpinBoxSetting(StyleSettings.nag_sigma_end, self, 0.0, 20.0, 0.05),
+        )
 
         self._edit_style = add(
             "linked_edit_style", ComboBoxSetting(StyleSettings.linked_edit_style, parent=self)

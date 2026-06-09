@@ -16,20 +16,23 @@ from PyQt5.QtWidgets import (
 
 from ..jobs import JobKind
 from ..localization import translate as _
-from ..model import Model, TileOverlapMode
+from ..model import Model, TileOverlapMode, UpscaleRefineMode
 from ..properties import Bind, Binding, bind, bind_combo, bind_toggle
 from ..resources import ControlMode, UpscalerName
 from ..root import root
+from ..style import SamplerPresets
 from . import theme
-from .settings_widgets import WarningIcon
+from .settings_widgets import NoWheelComboBox, WarningIcon
 from .switch import SwitchWidget
 from .theme import SignalBlocker, set_text_clipped
 from .widget import (
     ErrorBox,
     GenerateButton,
     QueueButton,
+    LoraDockerPanel,
     StrengthWidget,
     StyleSelectWidget,
+    TextPromptWidget,
     WorkspaceSelectWidget,
 )
 
@@ -155,9 +158,32 @@ class UpscaleWidget(QWidget):
         self.refinement_checkbox.setCheckable(True)
 
         self.style_select = StyleSelectWidget(self)
-        self.strength_slider = StrengthWidget(slider_range=(20, 50), prefix=False, parent=self)
+        self.refine_mode_combo = NoWheelComboBox(self)
+        self.refine_mode_combo.addItem(_("Tiled"), UpscaleRefineMode.tiled)
+        self.refine_mode_combo.addItem(_("Whole Image"), UpscaleRefineMode.whole_image)
+        self.refine_mode_combo.setToolTip(
+            _(
+                "Tiled uses less memory for large images. Whole Image refines the full image at once and preserves global context better."
+            )
+        )
+        refine_mode_layout = QHBoxLayout()
+        refine_mode_layout.addWidget(QLabel(_("Refine Mode"), self), 1)
+        refine_mode_layout.addWidget(self.refine_mode_combo, 3)
+
+        self.sampler_select = NoWheelComboBox(self)
+        self.sampler_select.setToolTip(
+            _(
+                "Sampler preset used only for upscale/refine. Leave on Style Sampler to use the selected style's sampler."
+            )
+        )
+        self._sync_sampler_presets()
+        sampler_layout = QHBoxLayout()
+        sampler_layout.addWidget(QLabel(_("Sampler"), self), 1)
+        sampler_layout.addWidget(self.sampler_select, 3)
+
+        self.strength_slider = StrengthWidget(slider_range=(0, 100), prefix=False, parent=self)
         strength_layout = QHBoxLayout()
-        strength_layout.addWidget(QLabel(_("Strength"), self), 1)
+        strength_layout.addWidget(QLabel(_("Denoise"), self), 1)
         strength_layout.addWidget(self.strength_slider, 3)
 
         self.unblur_slider = StrengthWidget(slider_range=(0, 100), prefix=False, parent=self)
@@ -165,6 +191,21 @@ class UpscaleWidget(QWidget):
         unblur_layout.addWidget(QLabel(_("Image guidance"), self), 1)
         unblur_layout.addWidget(self.unblur_slider, 3)
         root.connection.models_changed.connect(self._update_style)
+
+        self.upscale_prompt = TextPromptWidget(line_count=2, parent=self)
+        self.upscale_prompt.setPlaceholderText(
+            _("Optional prompt used only for upscale/refine, e.g. 8K, intricate details")
+        )
+        self.upscale_prompt.setToolTip(
+            _(
+                "Optional prompt used only for upscale/refine. When set, it overrides the generation prompt for upscale jobs."
+            )
+        )
+        prompt_edit_layout = QVBoxLayout()
+        prompt_edit_layout.addWidget(QLabel(_("Upscale Prompt"), self))
+        prompt_edit_layout.addWidget(self.upscale_prompt)
+
+        self.lora_panel = LoraDockerPanel(self)
 
         self.overlap_custom_combo = QComboBox(self)
         self.overlap_custom_combo.addItem(_("Automatic"), TileOverlapMode.auto)
@@ -179,6 +220,8 @@ class UpscaleWidget(QWidget):
         overlap_layout.addWidget(QLabel(_("Tile Overlap"), self), 2)
         overlap_layout.addWidget(self.overlap_custom_combo)
         overlap_layout.addWidget(self.overlap_input)
+        self.overlap_widget = QWidget(self)
+        self.overlap_widget.setLayout(overlap_layout)
 
         self.use_prompt_switch = SwitchWidget(self)
         self.use_prompt_switch.toggled.connect(self._update_prompt)
@@ -187,7 +230,7 @@ class UpscaleWidget(QWidget):
         self.prompt_label = QLabel(self)
         self.prompt_label.setMinimumWidth(40)
         prompt_layout = QHBoxLayout()
-        prompt_layout.addWidget(QLabel(_("Use Prompt"), self))
+        prompt_layout.addWidget(QLabel(_("Use Generation Prompt"), self))
         prompt_layout.addWidget(self.prompt_label, 1)
         prompt_layout.addWidget(self.prompt_warning)
         prompt_layout.addWidget(self.use_prompt_value)
@@ -195,13 +238,101 @@ class UpscaleWidget(QWidget):
 
         group_layout = QVBoxLayout(self.refinement_checkbox)
         group_layout.addWidget(self.style_select)
+        group_layout.addLayout(refine_mode_layout)
+        group_layout.addLayout(sampler_layout)
         group_layout.addLayout(strength_layout)
         group_layout.addLayout(unblur_layout)
-        group_layout.addLayout(overlap_layout)
+        group_layout.addLayout(prompt_edit_layout)
+        group_layout.addWidget(self.lora_panel)
+        group_layout.addWidget(self.overlap_widget)
         group_layout.addLayout(prompt_layout)
         self.refinement_checkbox.setLayout(group_layout)
         layout.addWidget(self.refinement_checkbox)
         self.factor_widget.input.setMinimumWidth(self.strength_slider._input.width() + 10)
+
+        self.seedvr2_group = QGroupBox(_("SeedVR2 Final Upscale"), self)
+        self.seedvr2_dit_combo = NoWheelComboBox(self)
+        self.seedvr2_vae_combo = NoWheelComboBox(self)
+        self.seedvr2_device_combo = NoWheelComboBox(self)
+        self.seedvr2_offload_combo = NoWheelComboBox(self)
+        self.seedvr2_vae_offload_combo = NoWheelComboBox(self)
+        self.seedvr2_tensor_offload_combo = NoWheelComboBox(self)
+        self.seedvr2_attention_combo = NoWheelComboBox(self)
+        for value in _seedvr2_attention_options:
+            self.seedvr2_attention_combo.addItem(value, value)
+        self.seedvr2_color_combo = NoWheelComboBox(self)
+        for value, text in _seedvr2_color_options:
+            self.seedvr2_color_combo.addItem(text, value)
+
+        self.seedvr2_input_noise = QDoubleSpinBox(self)
+        self.seedvr2_input_noise.setMinimum(0.0)
+        self.seedvr2_input_noise.setMaximum(1.0)
+        self.seedvr2_input_noise.setSingleStep(0.001)
+        self.seedvr2_input_noise.setDecimals(3)
+        self.seedvr2_input_noise.setToolTip(
+            _("SeedVR2 input noise injection. Leave at 0 unless troubleshooting artifacts.")
+        )
+        self.seedvr2_latent_noise = QDoubleSpinBox(self)
+        self.seedvr2_latent_noise.setMinimum(0.0)
+        self.seedvr2_latent_noise.setMaximum(1.0)
+        self.seedvr2_latent_noise.setSingleStep(0.001)
+        self.seedvr2_latent_noise.setDecimals(3)
+        self.seedvr2_latent_noise.setToolTip(
+            _("SeedVR2 latent noise injection. Leave at 0 unless the output needs softening.")
+        )
+        self.seedvr2_blocks_input = QSpinBox(self)
+        self.seedvr2_blocks_input.setMinimum(0)
+        self.seedvr2_blocks_input.setMaximum(36)
+        self.seedvr2_blocks_input.setToolTip(
+            _("SeedVR2 BlockSwap blocks. 0 disables BlockSwap; higher values use less VRAM but run slower.")
+        )
+        self.seedvr2_swap_io = QCheckBox(_("Swap I/O"), self)
+        self.seedvr2_swap_io.setToolTip(
+            _("Also offload SeedVR2 input/output layers with BlockSwap to reduce VRAM usage.")
+        )
+        self.seedvr2_vae_tiled = QCheckBox(_("VAE Tiling"), self)
+        self.seedvr2_vae_tiled.setToolTip(
+            _("Use tiled SeedVR2 VAE encode/decode to reduce VRAM usage at high resolutions.")
+        )
+        self.seedvr2_debug = QCheckBox(_("Debug"), self)
+        self.seedvr2_debug.setToolTip(_("Enable detailed SeedVR2 memory/timing logs."))
+
+        self.seedvr2_button = GenerateButton(JobKind.upscaling, self)
+        self.seedvr2_button.operation = _("Run SeedVR2")
+        self.seedvr2_button.clicked.connect(self.seedvr2_upscale)
+
+        seedvr2_layout = QVBoxLayout(self.seedvr2_group)
+        seedvr2_layout.addLayout(self._row(_("DiT Model"), self.seedvr2_dit_combo))
+        seedvr2_layout.addLayout(self._row(_("VAE Model"), self.seedvr2_vae_combo))
+        seedvr2_device_layout = QHBoxLayout()
+        seedvr2_device_layout.addWidget(QLabel(_("Device"), self), 1)
+        seedvr2_device_layout.addWidget(self.seedvr2_device_combo, 1)
+        seedvr2_device_layout.addWidget(QLabel(_("DiT Offload"), self), 1)
+        seedvr2_device_layout.addWidget(self.seedvr2_offload_combo, 1)
+        seedvr2_layout.addLayout(seedvr2_device_layout)
+        seedvr2_offload_layout = QHBoxLayout()
+        seedvr2_offload_layout.addWidget(QLabel(_("VAE Offload"), self), 1)
+        seedvr2_offload_layout.addWidget(self.seedvr2_vae_offload_combo, 1)
+        seedvr2_offload_layout.addWidget(QLabel(_("Tensor Offload"), self), 1)
+        seedvr2_offload_layout.addWidget(self.seedvr2_tensor_offload_combo, 1)
+        seedvr2_layout.addLayout(seedvr2_offload_layout)
+        seedvr2_layout.addLayout(self._row(_("Attention"), self.seedvr2_attention_combo))
+        seedvr2_layout.addLayout(self._row(_("Color"), self.seedvr2_color_combo))
+        seedvr2_noise_layout = QHBoxLayout()
+        seedvr2_noise_layout.addWidget(QLabel(_("Input Noise"), self), 1)
+        seedvr2_noise_layout.addWidget(self.seedvr2_input_noise, 1)
+        seedvr2_noise_layout.addWidget(QLabel(_("Latent Noise"), self), 1)
+        seedvr2_noise_layout.addWidget(self.seedvr2_latent_noise, 1)
+        seedvr2_layout.addLayout(seedvr2_noise_layout)
+        seedvr2_options_layout = QHBoxLayout()
+        seedvr2_options_layout.addWidget(QLabel(_("BlockSwap"), self))
+        seedvr2_options_layout.addWidget(self.seedvr2_blocks_input)
+        seedvr2_options_layout.addWidget(self.seedvr2_swap_io)
+        seedvr2_options_layout.addWidget(self.seedvr2_vae_tiled)
+        seedvr2_options_layout.addWidget(self.seedvr2_debug)
+        seedvr2_layout.addLayout(seedvr2_options_layout)
+        seedvr2_layout.addWidget(self.seedvr2_button)
+        layout.addWidget(self.seedvr2_group)
 
         self.upscale_button = GenerateButton(JobKind.upscaling, self)
         self.upscale_button.operation = _("Upscale")
@@ -243,29 +374,63 @@ class UpscaleWidget(QWidget):
                 bind_toggle(model.upscale, "inject_noise", self.noise_checkbox),
                 bind(model.upscale, "noise_strength", self.noise_slider, "value"),
                 bind_toggle(model.upscale, "use_diffusion", self.refinement_checkbox),
+                bind_combo(model.upscale, "refine_mode", self.refine_mode_combo),
                 bind(model, "style", self.style_select, "value"),
+                bind_combo(model.upscale, "sampler_preset", self.sampler_select),
                 bind(model.upscale, "strength", self.strength_slider, "value"),
                 bind(model.upscale, "unblur_strength", self.unblur_slider, "value"),
+                bind(model.upscale, "prompt", self.upscale_prompt, "text"),
                 bind_combo(model.upscale, "tile_overlap_mode", self.overlap_custom_combo),
                 bind(model.upscale, "tile_overlap", self.overlap_input, "value"),
                 bind_toggle(model.upscale, "use_prompt", self.use_prompt_switch),
+                bind_combo(model.upscale, "seedvr2_dit_model", self.seedvr2_dit_combo),
+                bind_combo(model.upscale, "seedvr2_vae_model", self.seedvr2_vae_combo),
+                bind_combo(model.upscale, "seedvr2_device", self.seedvr2_device_combo),
+                bind_combo(model.upscale, "seedvr2_dit_offload_device", self.seedvr2_offload_combo),
+                bind_combo(
+                    model.upscale, "seedvr2_vae_offload_device", self.seedvr2_vae_offload_combo
+                ),
+                bind_combo(
+                    model.upscale,
+                    "seedvr2_tensor_offload_device",
+                    self.seedvr2_tensor_offload_combo,
+                ),
+                bind_combo(model.upscale, "seedvr2_attention_mode", self.seedvr2_attention_combo),
+                bind_combo(model.upscale, "seedvr2_color_correction", self.seedvr2_color_combo),
+                bind(
+                    model.upscale, "seedvr2_input_noise_scale", self.seedvr2_input_noise, "value"
+                ),
+                bind(
+                    model.upscale, "seedvr2_latent_noise_scale", self.seedvr2_latent_noise, "value"
+                ),
+                bind(model.upscale, "seedvr2_blocks_to_swap", self.seedvr2_blocks_input, "value"),
+                bind_toggle(model.upscale, "seedvr2_swap_io_components", self.seedvr2_swap_io),
+                bind_toggle(model.upscale, "seedvr2_vae_tiled", self.seedvr2_vae_tiled),
+                bind_toggle(model.upscale, "seedvr2_enable_debug", self.seedvr2_debug),
                 bind(model.upscale, "can_generate", self.upscale_button, "enabled", Bind.one_way),
                 bind(model, "error", self.error_box, "error", Bind.one_way),
                 model.upscale.tile_overlap_mode_changed.connect(self._update_overlap),
+                model.upscale.refine_mode_changed.connect(self._update_refine_mode),
                 model.upscale.use_prompt_changed.connect(self._update_prompt),
                 model.regions.modified.connect(self._update_prompt),
                 model.regions.added.connect(self._update_prompt),
                 model.regions.removed.connect(self._update_prompt),
                 model.progress_changed.connect(self.update_progress),
                 model.style_changed.connect(self._update_style),
+                root.connection.models_changed.connect(self._sync_seedvr2_options),
+                model.upscale.can_generate_changed.connect(self._update_seedvr2_status),
             ]
             self.upscale_button.model = model
+            self.seedvr2_button.model = model
             self.queue_button.model = model
+            self.lora_panel.model = model
             self.noise_checkbox.toggled.connect(self._noise_layout_widget.setVisible)
             self._noise_layout_widget.setVisible(model.upscale.inject_noise)
             self._update_prompt()
             self._update_style()
             self._update_overlap()
+            self._update_refine_mode()
+            self._sync_seedvr2_options()
             self.update_progress()
 
     def update_models(self):
@@ -291,6 +456,81 @@ class UpscaleWidget(QWidget):
                         self.model_select.addItem(file, file)
                 selected = self.model_select.findData(self.model.upscale.upscaler)
                 self.model_select.setCurrentIndex(max(selected, 0))
+        self._sync_seedvr2_options()
+
+    def _sync_sampler_presets(self):
+        self.sampler_select.clear()
+        self.sampler_select.addItem(_("Style Sampler"), "")
+        for name in SamplerPresets.instance().names():
+            self.sampler_select.addItem(name, name)
+
+    def _row(self, label: str, widget: QWidget):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label, self), 1)
+        row.addWidget(widget, 3)
+        return row
+
+    def _sync_combo_options(self, combo: QComboBox, options: list[str], current: str):
+        with SignalBlocker(combo):
+            combo.clear()
+            for option in options:
+                combo.addItem(option, option)
+            index = combo.findData(current)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _seedvr2_options(self, node: str, input_name: str, fallback: list[str]):
+        if client := root.connection.client_if_connected:
+            options = client.models.node_inputs.options(node, input_name)
+            if options:
+                return options
+        return fallback
+
+    def _sync_seedvr2_options(self):
+        self._sync_combo_options(
+            self.seedvr2_dit_combo,
+            self._seedvr2_options("SeedVR2LoadDiTModel", "model", _seedvr2_dit_models),
+            self.model.upscale.seedvr2_dit_model,
+        )
+        self._sync_combo_options(
+            self.seedvr2_vae_combo,
+            self._seedvr2_options("SeedVR2LoadVAEModel", "model", _seedvr2_vae_models),
+            self.model.upscale.seedvr2_vae_model,
+        )
+        device_options = self._seedvr2_options(
+            "SeedVR2LoadDiTModel", "device", _seedvr2_devices
+        )
+        self._sync_combo_options(
+            self.seedvr2_device_combo, device_options, self.model.upscale.seedvr2_device
+        )
+        offload_options = ["none", "cpu"] + [d for d in device_options if d != "cpu"]
+        self._sync_combo_options(
+            self.seedvr2_offload_combo,
+            offload_options,
+            self.model.upscale.seedvr2_dit_offload_device,
+        )
+        self._sync_combo_options(
+            self.seedvr2_vae_offload_combo,
+            offload_options,
+            self.model.upscale.seedvr2_vae_offload_device,
+        )
+        self._sync_combo_options(
+            self.seedvr2_tensor_offload_combo,
+            offload_options,
+            self.model.upscale.seedvr2_tensor_offload_device,
+        )
+        self._update_seedvr2_status()
+
+    def _update_seedvr2_status(self):
+        installed = False
+        if client := root.connection.client_if_connected:
+            installed = "SeedVR2VideoUpscaler" in client.models.node_inputs
+        self.seedvr2_button.setEnabled(self.model.upscale.can_generate and installed)
+        if installed:
+            self.seedvr2_button.setToolTip("")
+        else:
+            self.seedvr2_button.setToolTip(
+                _("Install ComfyUI-SeedVR2_VideoUpscaler and restart the server to enable this.")
+            )
 
     def update_progress(self):
         self.progress_bar.setValue(int(self.model.progress * 100))
@@ -298,10 +538,17 @@ class UpscaleWidget(QWidget):
     def upscale(self):
         self.model.upscale_image()
 
+    def seedvr2_upscale(self):
+        self.model.seedvr2_upscale_image()
+
     def _update_overlap(self):
         self.overlap_input.setEnabled(
             self.model.upscale.tile_overlap_mode is TileOverlapMode.custom
         )
+
+    def _update_refine_mode(self):
+        is_tiled = self.model.upscale.refine_mode is UpscaleRefineMode.tiled
+        self.overlap_widget.setVisible(is_tiled)
 
     def _update_style(self):
         arch = self.model.arch
@@ -356,3 +603,33 @@ def _upscaler_order(filename: str):
         UpscalerName.quality.value: 2,
         UpscalerName.sharp.value: 3,
     }.get(filename, 99)
+
+
+_seedvr2_dit_models = [
+    "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+    "seedvr2_ema_3b_fp16.safetensors",
+    "seedvr2_ema_3b-Q8_0.gguf",
+    "seedvr2_ema_3b-Q4_K_M.gguf",
+    "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+    "seedvr2_ema_7b-Q4_K_M.gguf",
+    "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+    "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
+]
+
+_seedvr2_vae_models = ["ema_vae_fp16.safetensors"]
+_seedvr2_devices = ["cuda:0", "cpu"]
+_seedvr2_attention_options = [
+    "sdpa",
+    "flash_attn_2",
+    "flash_attn_3",
+    "sageattn_2",
+    "sageattn_3",
+]
+_seedvr2_color_options = [
+    ("lab", "LAB"),
+    ("wavelet", "Wavelet"),
+    ("wavelet_adaptive", "Wavelet Adaptive"),
+    ("hsv", "HSV"),
+    ("adain", "AdaIN"),
+    ("none", _("None")),
+]

@@ -37,6 +37,9 @@ async def create_process(
         platform_args["preexec_fn"] = set_pdeathsig
 
     env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if is_windows:
+        env.setdefault("PYTHONUTF8", "1")
     if additional_env:
         env.update(additional_env)
     if "PYTHONPATH" in env:

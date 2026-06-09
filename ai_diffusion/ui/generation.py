@@ -27,10 +27,12 @@ from PyQt5.QtGui import (
     QPainter,
 )
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QAction,
     QCheckBox,
     QComboBox,
     QDialog,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QListView,
@@ -42,6 +44,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -160,6 +164,101 @@ class ImageCompareDialog(QDialog):
         self.resize(target)
 
 
+class MetadataCompareDialog(QDialog):
+    def __init__(self, left_title: str, right_title: str, rows: list[tuple[str, str, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Compare Metadata"))
+        self._rows = rows
+
+        layout = QVBoxLayout(self)
+        header = QLabel(
+            "<b>" + escape(left_title) + "</b>"
+            + f" <span style='color: {theme.grey};'>"
+            + escape(_("vs."))
+            + "</span> "
+            + "<b>" + escape(right_title) + "</b>",
+            self,
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        self._show_unchanged = QCheckBox(_("Show unchanged fields"), self)
+        self._show_unchanged.toggled.connect(self._populate)
+        layout.addWidget(self._show_unchanged)
+
+        self._table = QTableWidget(self)
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels([_("Field"), _("First"), _("Second")])
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.setWordWrap(True)
+        self._table.verticalHeader().hide()
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table, 1)
+
+        close = QPushButton(_("Close"), self)
+        close.clicked.connect(self.accept)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+        self._populate()
+        self._resize_to_screen()
+
+    def _populate(self):
+        show_unchanged = self._show_unchanged.isChecked()
+        rows = [row for row in self._rows if show_unchanged or row[1] != row[2]]
+        self._table.clearSpans()
+        self._table.setRowCount(len(rows))
+        if not rows:
+            self._table.setRowCount(1)
+            self._table.setSpan(0, 0, 1, 3)
+            item = QTableWidgetItem(_("No metadata differences."))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(0, 0, item)
+            self._table.resizeRowsToContents()
+            return
+
+        changed_bg = QColor("#3d3416") if theme.is_dark else QColor("#fff1b8")
+        added_bg = QColor("#173d25") if theme.is_dark else QColor("#d9f7df")
+        removed_bg = QColor("#4a2020") if theme.is_dark else QColor("#ffdede")
+
+        for row, (label, left, right) in enumerate(rows):
+            values = [label, left, right]
+            if left == right:
+                backgrounds = [None, None, None]
+            elif left and not right:
+                backgrounds = [changed_bg, removed_bg, removed_bg]
+            elif right and not left:
+                backgrounds = [changed_bg, added_bg, added_bg]
+            else:
+                backgrounds = [changed_bg, changed_bg, changed_bg]
+
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if background := backgrounds[column]:
+                    item.setData(Qt.ItemDataRole.BackgroundRole, background)
+                self._table.setItem(row, column, item)
+
+        self._table.resizeRowsToContents()
+
+    def _resize_to_screen(self):
+        screen = QGuiApplication.screenAt(self.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(920, 620)
+            return
+        available = screen.availableGeometry()
+        self.resize(
+            min(980, max(720, available.width() - 100)),
+            min(720, max(520, available.height() - 120)),
+        )
+
+
 class HistoryWidget(QListWidget):
     _model: Model
     _connections: list[QMetaObject.Connection]
@@ -253,15 +352,15 @@ class HistoryWidget(QListWidget):
         group_key = self._history_group_key(job.params)
         if self._last_group_key != group_key:
             self._last_group_key = group_key
-            prompt = job.params.name if job.params.name != "" else "<no prompt>"
-            strength = job.params.metadata.get("strength", 1.0)
-            strength = f"{strength * 100:.0f}% - " if strength != 1.0 else ""
-
-            header = QListWidgetItem(f"{job.timestamp:%H:%M} - {strength}{prompt}")
+            header = QListWidgetItem(self._history_group_title(job))
             header.setFlags(Qt.ItemFlag.NoItemFlags)
             header.setData(Qt.ItemDataRole.UserRole, job.id)
-            header.setData(Qt.ItemDataRole.ToolTipRole, job.params.prompt)
-            header.setSizeHint(QSize(9999, self.fontMetrics().lineSpacing() + 4))
+            header.setData(Qt.ItemDataRole.ToolTipRole, self._job_info_html(job.params))
+            header.setData(Qt.ItemDataRole.ForegroundRole, QColor(theme.grey))
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            header.setSizeHint(QSize(9999, self.fontMetrics().lineSpacing() + 6))
             header.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
             self.addItem(header)
 
@@ -303,8 +402,41 @@ class HistoryWidget(QListWidget):
             meta.get("style", ""),
             meta.get("checkpoint", ""),
             repr(meta.get("loras", [])),
-            repr(meta.get("control", [])),
+            repr(self._control_group_key(meta.get("control", []))),
         )
+
+    def _control_group_key(self, value: object):
+        if not isinstance(value, list):
+            return value
+        result = []
+        for control in value:
+            if not isinstance(control, dict):
+                continue
+            result.append((control.get("mode"), control.get("image")))
+        return result
+
+    def _history_group_title(self, job: Job):
+        params = job.params
+        meta = params.metadata
+        parts = []
+        if "denoise" in meta:
+            parts.append(f"{float(meta['denoise']) * 100:.0f}%")
+        elif params.strength != 1.0:
+            parts.append(f"{params.strength * 100:.0f}%")
+
+        sampler = self._short_file(meta.get("sampler", ""))
+        if sampler:
+            parts.append(sampler)
+
+        lora_count = len(self._format_loras(meta.get("loras", [])))
+        if lora_count:
+            parts.append(_("LoRA") + f" x{lora_count}")
+
+        control_count = len(self._format_control(meta.get("control", [])))
+        if control_count:
+            parts.append(_("Control") + f" x{control_count}")
+
+        return "  |  ".join(parts) if parts else _("Generation")
 
     _job_info_translations: ClassVar[dict[str, str]] = {
         "prompt": _("Prompt"),
@@ -434,6 +566,19 @@ class HistoryWidget(QListWidget):
                 end = self._format_float(scheduled.get("to", ""))
                 schedule = scheduled.get("schedule", "")
                 rows.append((_("Scheduled CFG"), f"{start} -> {end} {schedule}".strip()))
+        if nag := meta.get("nag"):
+            if isinstance(nag, dict):
+                rows.append(
+                    (
+                        _("NAG"),
+                        "scale {scale}  tau {tau}  alpha {alpha}  sigma_end {sigma_end}".format(
+                            scale=self._format_float(nag.get("scale", "")),
+                            tau=self._format_float(nag.get("tau", "")),
+                            alpha=self._format_float(nag.get("alpha", "")),
+                            sigma_end=self._format_float(nag.get("sigma_end", "")),
+                        ),
+                    )
+                )
         if "denoise" in meta:
             denoise = f"{float(meta['denoise']) * 100:.0f}%"
             actual = meta.get("actual_steps")
@@ -704,6 +849,34 @@ class HistoryWidget(QListWidget):
         if job := self._model.jobs.find(job_id):
             item.setIcon(self._image_thumbnail(job, index, False))
 
+    def _job_timestamp(self, job: Job):
+        return job.timestamp.astimezone().strftime("%H:%M")
+
+    def _draw_thumbnail_badge(
+        self, pixmap, text: str, alignment: Qt.AlignmentFlag | Qt.Alignment
+    ):
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(font.pointSize() + 3, round(font.pointSize() * 1.45)))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        padding_x = 8
+        padding_y = 4
+        width = metrics.horizontalAdvance(text) + padding_x * 2
+        height = metrics.height() + padding_y * 2
+        margin = 4
+        x = margin if alignment & Qt.AlignmentFlag.AlignLeft else pixmap.width() - width - margin
+        y = margin if alignment & Qt.AlignmentFlag.AlignTop else pixmap.height() - height - margin
+        rect = QRect(x, y, width, height)
+        painter.setPen(QColor(255, 255, 255, 210))
+        painter.setBrush(QColor(0, 0, 0, 175))
+        painter.drawRoundedRect(rect, 4, 4)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+
     def _image_thumbnail(self, job: Job, index: int, is_new: bool = False):
         image = job.results[index]
         # Use 2x thumb size for good quality on high-DPI screens
@@ -735,6 +908,11 @@ class HistoryWidget(QListWidget):
             painter.setPen(QColor("#111111"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
             painter.end()
+        self._draw_thumbnail_badge(
+            pixmap,
+            self._job_timestamp(job),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        )
         return QIcon(pixmap)
 
     def _show_context_menu(self, pos: QPoint):
@@ -753,6 +931,10 @@ class HistoryWidget(QListWidget):
             menu.addSeparator()
             compare_action = ensure(menu.addAction(_("Compare Selected"), self._compare_selected))
             compare_action.setEnabled(len(self._selected_images()) == 2)
+            compare_meta_action = ensure(
+                menu.addAction(_("Compare Metadata"), self._compare_metadata_selected)
+            )
+            compare_meta_action.setEnabled(len(self._selected_results()) == 2)
             save_action = ensure(menu.addAction(_("Save Image"), self._save_image))
             if self._model.document.filename == "":
                 tt = _(
@@ -809,20 +991,66 @@ class HistoryWidget(QListWidget):
         if (job := self.selected_job) and (clipboard := QGuiApplication.clipboard()):
             clipboard.setText(self._job_info_plain(job.params, include_usage=False))
 
-    def _selected_images(self):
-        images = []
+    def _selected_results(self):
+        results: list[tuple[Job, int]] = []
         for item in self.selectedItems():
             data = self._item_data(item)
             if job := self._model.jobs.find(data.job):
                 if isinstance(data.image, int) and 0 <= data.image < len(job.results):
-                    images.append(job.results[data.image])
-        return images
+                    results.append((job, data.image))
+        return results
+
+    def _selected_images(self):
+        return [job.results[index] for job, index in self._selected_results()]
 
     def _compare_selected(self):
         images = self._selected_images()
         if len(images) == 2:
             dialog = ImageCompareDialog(images[0], images[1], self)
             dialog.exec()
+
+    def _metadata_rows(self, params: JobParams):
+        rows: list[tuple[str, str]] = [
+            (str(label), str(value)) for label, value in self._core_info(params)
+        ]
+        for key, formatter in [
+            ("loras", self._format_loras),
+            ("control", self._format_control),
+            ("text_encoders", self._format_text_encoders),
+        ]:
+            lines = formatter(params.metadata.get(key, []))
+            if lines:
+                rows.append((self._job_info_translations[key], "\n".join(lines)))
+
+        for label, value in self._dedup_prompt_sections(params):
+            rows.append((label, "\n".join(self._wrap_plain(value, width=110))))
+        return rows
+
+    def _metadata_compare_rows(self, left: JobParams, right: JobParams):
+        left_rows = dict(self._metadata_rows(left))
+        right_rows = dict(self._metadata_rows(right))
+        labels = list(left_rows)
+        labels.extend(label for label in right_rows if label not in left_rows)
+        return [(label, left_rows.get(label, ""), right_rows.get(label, "")) for label in labels]
+
+    def _result_title(self, job: Job, index: int):
+        title = self._job_title(job.params)
+        if len(job.results) > 1:
+            title += f" #{index + 1}"
+        return title
+
+    def _compare_metadata_selected(self):
+        results = self._selected_results()
+        if len(results) != 2:
+            return
+        (left_job, left_index), (right_job, right_index) = results
+        dialog = MetadataCompareDialog(
+            self._result_title(left_job, left_index),
+            self._result_title(right_job, right_index),
+            self._metadata_compare_rows(left_job.params, right_job.params),
+            self,
+        )
+        dialog.exec()
 
     def _save_image(self):
         items = self.selectedItems()

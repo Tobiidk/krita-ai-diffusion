@@ -19,6 +19,7 @@ from ai_diffusion.api import (
     LoraInput,
     RegionInput,
     SamplingInput,
+    SeedVR2Input,
     UpscaleInput,
     WorkflowInput,
     WorkflowKind,
@@ -99,6 +100,162 @@ def test_sampling_denoise_keeps_requested_steps():
     assert sampling.denoise_strength == 0.5
 
 
+def test_selected_region_denoise_uses_context_compatible_steps():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("flux2.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    style.sampler_steps = 8
+    image = Image.create(Extent(512, 512))
+    mask = Mask.rectangle(Bounds(128, 128, 256, 256), Bounds(0, 0, 512, 512))
+    inpaint = InpaintParams(InpaintMode.custom, mask.bounds, FillMode.none)
+
+    work = workflow.prepare(
+        WorkflowKind.refine_region,
+        image,
+        ConditioningInput("refine selected area"),
+        style,
+        1,
+        models,
+        files,
+        default_perf,
+        mask=mask,
+        strength=0.5,
+        inpaint=inpaint,
+    )
+
+    assert work.sampling is not None
+    assert work.sampling.total_steps == 8
+    assert work.sampling.start_step == 4
+    assert work.sampling.actual_steps == 4
+    assert work.sampling.denoise_strength == 0.5
+
+
+def test_upscale_whole_image_refine_does_not_create_tiles():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("flux2.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    style.sampler_steps = 4
+    image = Image.create(Extent(512, 512))
+
+    work = workflow.prepare(
+        WorkflowKind.upscale_refine,
+        image,
+        ConditioningInput("add fine detail"),
+        style,
+        1,
+        models,
+        files,
+        default_perf,
+        strength=0.5,
+        upscale_factor=1.0,
+        upscale=UpscaleInput("", -1),
+    )
+    graph = workflow.create(work, models)
+    node_types = [node["class_type"] for node in graph.root.values()]
+
+    assert work.kind is WorkflowKind.upscale_refine
+    assert "SamplerCustomAdvanced" in node_types
+    assert "ETN_TileLayout" not in node_types
+
+
+def test_upscale_zero_denoise_bypasses_diffusion_refine():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("flux2.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    image = Image.create(Extent(512, 512))
+
+    work = workflow.prepare(
+        WorkflowKind.upscale_refine,
+        image,
+        ConditioningInput(""),
+        style,
+        1,
+        models,
+        files,
+        default_perf,
+        strength=0.0,
+        upscale_factor=1.0,
+        upscale=UpscaleInput("", -1),
+    )
+    graph = workflow.create(work, models)
+    node_types = [node["class_type"] for node in graph.root.values()]
+
+    assert work.sampling is not None
+    assert work.sampling.actual_steps == 0
+    assert work.sampling.denoise_strength == 0.0
+    assert "SamplerCustomAdvanced" not in node_types
+    assert "CheckpointLoaderSimple" not in node_types
+
+
+def test_flux2_upscale_sampler_preset_uses_guide_style_values():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("flux2.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    image = Image.create(Extent(512, 512))
+
+    work = workflow.prepare(
+        WorkflowKind.upscale_refine,
+        image,
+        ConditioningInput("add fine detail"),
+        style,
+        1,
+        models,
+        files,
+        default_perf,
+        strength=0.8,
+        upscale_factor=1.0,
+        upscale=UpscaleInput("", -1),
+        sampler_preset="Flux 2 Upscale - Euler A CFG++",
+    )
+    graph = workflow.create(work, models)
+    sampler = next(node for node in graph.root.values() if node["class_type"] == "KSamplerSelect")
+    scheduler = next(node for node in graph.root.values() if node["class_type"] == "BasicScheduler")
+
+    assert work.sampling is not None
+    assert work.sampling.sampler == "euler_ancestral_cfg_pp"
+    assert work.sampling.scheduler == "sgm_uniform"
+    assert work.sampling.actual_steps == 20
+    assert work.sampling.total_steps == 25
+    assert work.sampling.denoise_strength == 0.8
+    assert sampler["inputs"]["sampler_name"] == "euler_ancestral_cfg_pp"
+    assert scheduler["inputs"]["scheduler"] == "sgm_uniform"
+
+
+def test_seedvr2_upscale_workflow():
+    image = Image.create(Extent(512, 512))
+    seedvr2 = SeedVR2Input(seed=123, color_correction="wavelet", vae_tiled=True)
+
+    work = workflow.prepare_seedvr2_upscale(image, seedvr2, 2.0)
+    graph = workflow.create(work, ClientModels())
+    nodes = list(graph.root.values())
+    node_types = [node["class_type"] for node in nodes]
+    upscaler = next(node for node in nodes if node["class_type"] == "SeedVR2VideoUpscaler")
+    vae = next(node for node in nodes if node["class_type"] == "SeedVR2LoadVAEModel")
+
+    assert work.kind is WorkflowKind.seedvr2_upscale
+    assert work.extent.target == Extent(1024, 1024)
+    assert "SeedVR2LoadDiTModel" in node_types
+    assert "SeedVR2LoadVAEModel" in node_types
+    assert upscaler["inputs"]["seed"] == 123
+    assert upscaler["inputs"]["resolution"] == 1024
+    assert upscaler["inputs"]["batch_size"] == 1
+    assert upscaler["inputs"]["color_correction"] == "wavelet"
+    assert vae["inputs"]["encode_tiled"]
+    assert vae["inputs"]["decode_tiled"]
+
+
 def test_sampling_reads_scheduled_cfg_from_sampler_preset():
     style = Style(Path("flux2.json"))
     style.sampler = "Flux 2 - Euler Scheduled CFG"
@@ -137,6 +294,23 @@ def test_scheduled_cfg_keeps_negative_conditioning_branch():
 
     cond = workflow.Conditioning.from_input(
         ConditioningInput(positive="change the background", negative=""), sampling
+    )
+
+    assert cond.negative is not None
+
+
+def test_nag_keeps_negative_conditioning_branch_at_cfg_one():
+    sampling = SamplingInput(
+        sampler="euler",
+        scheduler="flux2",
+        cfg_scale=1.0,
+        total_steps=8,
+        nag_enabled=True,
+    )
+
+    cond = workflow.Conditioning.from_input(
+        ConditioningInput(positive="change the background", negative="exposed nipples"),
+        sampling,
     )
 
     assert cond.negative is not None
@@ -344,6 +518,11 @@ def test_prepare_negative():
     assert live.metadata["negative_prompt"] == "piong"
     assert live.metadata["negative_prompt_final"] == ""
 
+    style.nag_enabled = True
+    nag = workflow.prepare_prompts(cond, style, 1, Arch.flux2_9b, files=files, is_live=True)
+    assert nag.conditioning.negative == "neg-beg piong neg-end"
+    assert nag.metadata["negative_prompt_final"] == "neg-beg piong neg-end"
+
 
 def test_prepare_wildcards():
     files = FileLibrary(FileCollection(), FileCollection())
@@ -548,10 +727,84 @@ def test_flux2_reference_control_strength_softens_reference_latent():
     )
     graph = workflow.create(work, models)
     blur = next(node for node in graph.root.values() if node["class_type"] == "ImageBlur")
+    blend = next(node for node in graph.root.values() if node["class_type"] == "ImageBlend")
 
-    assert blur["inputs"]["blur_radius"] == 19
+    assert blur["inputs"]["blur_radius"] == 22
     assert blur["inputs"]["sigma"] == 1.0
+    assert blend["inputs"]["blend_factor"] == 0.6
+    assert blend["inputs"]["blend_mode"] == "normal"
     assert "ReferenceLatent" in [node["class_type"] for node in graph.root.values()]
+
+
+def test_flux2_edit_reference_kept_with_extra_reference_control():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    style.sampler_steps = 4
+    image = Image.create(Extent(512, 512))
+    cond = ConditioningInput(
+        "test",
+        control=[ControlInput(ControlMode.reference, Image.create(Extent(512, 512)), 0.5)],
+    )
+    cond.edit_reference = True
+
+    work = workflow.prepare(
+        WorkflowKind.refine,
+        image,
+        cond,
+        style,
+        1,
+        models,
+        FileLibrary(FileCollection(), FileCollection()),
+        PerformanceSettings(batch_size=1),
+        strength=0.5,
+    )
+    graph = workflow.create(work, models)
+
+    reference_latents = [
+        node for node in graph.root.values() if node["class_type"] == "ReferenceLatent"
+    ]
+    assert len(reference_latents) == 4
+    assert len({tuple(node["inputs"]["latent"]) for node in reference_latents}) == 2
+
+
+def test_flux2_nag_uses_nag_guider():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.flux2_4b)}
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.style_prompt = ""
+    style.sampler = "Flux 2 - Euler"
+    style.sampler_steps = 4
+    style.cfg_scale = 1.0
+    style.nag_enabled = True
+    style.nag_scale = 8.0
+    style.nag_tau = 2.5
+    style.nag_alpha = 0.25
+    style.nag_sigma_end = 0.75
+    cond = ConditioningInput("test", negative="exposed nipples")
+
+    work = workflow.prepare(
+        WorkflowKind.generate,
+        Extent(512, 512),
+        cond,
+        style,
+        1,
+        models,
+        FileLibrary(FileCollection(), FileCollection()),
+        PerformanceSettings(batch_size=1),
+    )
+    graph = workflow.create(work, models)
+    nag = next(node for node in graph.root.values() if node["class_type"] == "NAGGuider")
+
+    assert nag["inputs"]["nag_scale"] == 8.0
+    assert nag["inputs"]["nag_tau"] == 2.5
+    assert nag["inputs"]["nag_alpha"] == 0.25
+    assert nag["inputs"]["nag_sigma_end"] == 0.75
+    assert "BasicGuider" not in [node["class_type"] for node in graph.root.values()]
 
 
 def test_resolve_text_encoders_records_default_for_diffusion_model():

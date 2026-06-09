@@ -3,7 +3,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from krita import DockWidgetFactory, DockWidgetFactoryBase, Extension, Krita, Window  # type: ignore
-from PyQt5.QtCore import QEvent
+from PyQt5.QtCore import QEvent, QTimer
 from PyQt5.QtGui import QKeyEvent, QKeySequence
 from PyQt5.QtWidgets import (
     QAction,
@@ -31,6 +31,7 @@ class AIToolsExtension(Extension):
         super().__init__(parent)
         self._actions: dict[str, QAction] = {}
         self._event_filter_installed = False
+        self._autostart_started = False
 
         log.info(f"Extension initialized, Version: {__version__}, Python: {sys.version}")
 
@@ -54,9 +55,12 @@ class AIToolsExtension(Extension):
             )
 
         eventloop.setup()
+        log.info("Loading plugin settings")
         settings.load()
+        log.info("Initializing plugin root")
         root.init()
-        self._settings_dialog = SettingsDialog(root.server)
+        log.info("Plugin root initialized")
+        self._settings_dialog: SettingsDialog | None = None
 
         notifier = Krita.instance().notifier()
         notifier.setActive(True)
@@ -64,9 +68,33 @@ class AIToolsExtension(Extension):
         if app := QApplication.instance():
             app.installEventFilter(self)
             self._event_filter_installed = True
+            QTimer.singleShot(0, self._start_autostart_once)
+        log.info("Extension constructor completed")
 
     def setup(self):
-        eventloop.run(root.autostart(self._settings_dialog.connection.update_ui))
+        log.info("Extension setup called")
+        self._start_autostart_once()
+
+    def _start_autostart_once(self):
+        if self._autostart_started:
+            return
+        self._autostart_started = True
+        log.info("Starting plugin autostart")
+        eventloop.run(root.autostart(self._notify_server_settings_changed))
+
+    def _notify_server_settings_changed(self):
+        if self._settings_dialog is not None:
+            self._settings_dialog.connection.update_ui()
+
+    def _show_settings(self):
+        if self._settings_dialog is None:
+            try:
+                log.info("Creating settings dialog")
+                self._settings_dialog = SettingsDialog(root.server)
+            except Exception as e:
+                log.exception(f"Failed to create settings dialog: {e}")
+                return
+        self._settings_dialog.show()
 
     def shutdown(self):
         if self._event_filter_installed:
@@ -120,7 +148,8 @@ class AIToolsExtension(Extension):
         self._actions[name] = action
 
     def createActions(self, window):
-        self._create_action(window, "settings", self._settings_dialog.show)
+        log.info("Creating plugin actions")
+        self._create_action(window, "settings", self._show_settings)
         self._create_action(window, "generate", actions.generate)
         self._create_action(window, "cancel", actions.cancel_active)
         self._create_action(window, "cancel_queued", actions.cancel_queued)

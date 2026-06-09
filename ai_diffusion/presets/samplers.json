@@ -120,6 +120,13 @@
         "cfg_start": 1.0,
         "cfg_end": 1.5
     },
+    "Flux 2 Upscale - Euler A CFG++": {
+        "sampler": "euler_ancestral_cfg_pp",
+        "scheduler": "sgm_uniform",
+        "steps": 20,
+        "minimum_steps": 3,
+        "cfg": 1.0
+    },
     "RES4LYF Flux 2 - RES 2M": {
         "sampler": "res_2m",
         "scheduler": "flux2",

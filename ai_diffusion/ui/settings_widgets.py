@@ -8,6 +8,7 @@ from PyQt5.QtGui import QFontMetrics, QIcon
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -251,6 +252,38 @@ class SpinBoxSetting(SettingWidget):
     def add_checkbox(self, text: str):
         self._spinbox.setSpecialValueText("Default")
         return super().add_checkbox(text)
+
+
+class DoubleSpinBoxSetting(SettingWidget):
+    def __init__(
+        self,
+        setting: Setting,
+        parent=None,
+        minimum=0.0,
+        maximum=100.0,
+        step=0.1,
+        decimals=2,
+        suffix="",
+    ):
+        super().__init__(setting, parent)
+
+        self._spinbox = QDoubleSpinBox(self)
+        self._spinbox.setMinimumWidth(100)
+        self._spinbox.setMinimum(minimum)
+        self._spinbox.setMaximum(maximum)
+        self._spinbox.setSingleStep(step)
+        self._spinbox.setDecimals(decimals)
+        self._spinbox.setSuffix(suffix)
+        self._spinbox.valueChanged.connect(lambda _value: self._notify_value_changed())
+        self.set_widget(self._spinbox)
+
+    @property
+    def value(self):
+        return self._spinbox.value()
+
+    @value.setter
+    def value(self, v):
+        self._spinbox.setValue(float(v))
 
 
 class SliderSetting(SettingWidget):
