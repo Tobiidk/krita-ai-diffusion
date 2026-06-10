@@ -235,7 +235,16 @@ def test_flux2_upscale_sampler_preset_uses_guide_style_values():
 
 def test_seedvr2_upscale_workflow():
     image = Image.create(Extent(512, 512))
-    seedvr2 = SeedVR2Input(seed=123, color_correction="wavelet", vae_tiled=True)
+    seedvr2 = SeedVR2Input(
+        seed=123,
+        color_correction="wavelet",
+        vae_tiled=True,
+        vae_tile_size=1536,
+        vae_tile_overlap=192,
+        tile_auto=False,
+        tile_rows=1,
+        tile_columns=1,
+    )
 
     work = workflow.prepare_seedvr2_upscale(image, seedvr2, 2.0)
     graph = workflow.create(work, ClientModels())
@@ -254,6 +263,54 @@ def test_seedvr2_upscale_workflow():
     assert upscaler["inputs"]["color_correction"] == "wavelet"
     assert vae["inputs"]["encode_tiled"]
     assert vae["inputs"]["decode_tiled"]
+    assert vae["inputs"]["encode_tile_size"] == 1536
+    assert vae["inputs"]["decode_tile_size"] == 1536
+    assert vae["inputs"]["encode_tile_overlap"] == 192
+    assert vae["inputs"]["decode_tile_overlap"] == 192
+
+
+def test_seedvr2_tiled_upscale_workflow():
+    image = Image.create(Extent(512, 512))
+    seedvr2 = SeedVR2Input(
+        seed=123,
+        tile_auto=False,
+        tile_rows=4,
+        tile_columns=4,
+        tile_overlap=32,
+    )
+
+    work = workflow.prepare_seedvr2_upscale(image, seedvr2, 2.0)
+    graph = workflow.create(work, ClientModels())
+    nodes = list(graph.root.values())
+    upscalers = [node for node in nodes if node["class_type"] == "SeedVR2VideoUpscaler"]
+    crops = [node for node in nodes if node["class_type"] == "ImageCrop"]
+    stitches = [node for node in nodes if node["class_type"] == "ImageStitch"]
+
+    assert work.extent.target == Extent(1024, 1024)
+    assert len(upscalers) == 16
+    assert len(crops) == 32
+    assert len(stitches) == 15
+    assert sorted({node["inputs"]["resolution"] for node in upscalers}) == [320, 384]
+    assert sorted({node["inputs"]["width"] for node in crops}) == [160, 192, 256]
+    assert sorted({node["inputs"]["height"] for node in crops}) == [160, 192, 256]
+
+
+def test_seedvr2_auto_tile_grid_uses_target_aspect():
+    image = Image.create(Extent(1375, 2048))
+    seedvr2 = SeedVR2Input(seed=123, tile_auto=True, tile_overlap=0)
+
+    work = workflow.prepare_seedvr2_upscale(image, seedvr2, 2.0)
+    graph = workflow.create(work, ClientModels())
+    nodes = list(graph.root.values())
+    upscalers = [node for node in nodes if node["class_type"] == "SeedVR2VideoUpscaler"]
+    crops = [node for node in nodes if node["class_type"] == "ImageCrop"]
+    stitches = [node for node in nodes if node["class_type"] == "ImageStitch"]
+
+    assert work.extent.target == Extent(2750, 4096)
+    assert workflow.seedvr2_auto_tile_grid(work.extent.target) == (4, 3)
+    assert len(upscalers) == 12
+    assert len(crops) == 12
+    assert len(stitches) == 11
 
 
 def test_sampling_reads_scheduled_cfg_from_sampler_preset():

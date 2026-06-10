@@ -1439,6 +1439,82 @@ def upscale_simple(w: ComfyWorkflow, image: Image, model: str, factor: float):
     return w
 
 
+def _grid_bounds(extent: Extent, rows: int, columns: int):
+    rows = max(1, min(rows, extent.height))
+    columns = max(1, min(columns, extent.width))
+    return [
+        [
+            Bounds(
+                (column * extent.width) // columns,
+                (row * extent.height) // rows,
+                ((column + 1) * extent.width) // columns - (column * extent.width) // columns,
+                ((row + 1) * extent.height) // rows - (row * extent.height) // rows,
+            )
+            for column in range(columns)
+        ]
+        for row in range(rows)
+    ]
+
+
+def _pad_bounds(bounds: Bounds, extent: Extent, padding: int):
+    if padding <= 0:
+        return bounds
+    x0 = max(0, bounds.x - padding)
+    y0 = max(0, bounds.y - padding)
+    x1 = min(extent.width, bounds.x + bounds.width + padding)
+    y1 = min(extent.height, bounds.y + bounds.height + padding)
+    return Bounds(x0, y0, x1 - x0, y1 - y0)
+
+
+def _map_bounds(bounds: Bounds, source: Extent, target: Extent):
+    x0 = round(bounds.x * target.width / source.width)
+    y0 = round(bounds.y * target.height / source.height)
+    x1 = round((bounds.x + bounds.width) * target.width / source.width)
+    y1 = round((bounds.y + bounds.height) * target.height / source.height)
+    return Bounds(x0, y0, x1 - x0, y1 - y0)
+
+
+def seedvr2_auto_tile_grid(extent: Extent):
+    if extent.width <= 0 or extent.height <= 0:
+        return 4, 4
+    if extent.height >= extent.width:
+        rows = 4
+        columns = max(1, round(rows * extent.width / extent.height))
+    else:
+        columns = 4
+        rows = max(1, round(columns * extent.height / extent.width))
+    return rows, columns
+
+
+def seedvr2_tile_grid(seedvr2: SeedVR2Input, target_extent: Extent):
+    if seedvr2.tile_auto:
+        return seedvr2_auto_tile_grid(target_extent)
+    return seedvr2.tile_rows, seedvr2.tile_columns
+
+
+def _seedvr2_upscale_tile(
+    w: ComfyWorkflow,
+    image: Output,
+    dit: Output,
+    vae: Output,
+    seedvr2: SeedVR2Input,
+    target_extent: Extent,
+):
+    out_image = w.seedvr2_upscale(
+        image,
+        dit,
+        vae,
+        seedvr2.seed,
+        target_extent.shortest_side,
+        seedvr2.color_correction,
+        seedvr2.input_noise_scale,
+        seedvr2.latent_noise_scale,
+        seedvr2.tensor_offload_device,
+        seedvr2.enable_debug,
+    )
+    return w.scale_image(out_image, target_extent)
+
+
 def seedvr2_upscale(
     w: ComfyWorkflow,
     image: Image,
@@ -1465,20 +1541,42 @@ def seedvr2_upscale(
         seedvr2.vae_tile_size,
         seedvr2.vae_tile_overlap,
     )
-    out_image = w.seedvr2_upscale(
-        in_image,
-        dit,
-        vae,
-        seedvr2.seed,
-        target_extent.shortest_side,
-        seedvr2.color_correction,
-        seedvr2.input_noise_scale,
-        seedvr2.latent_noise_scale,
-        seedvr2.tensor_offload_device,
-        seedvr2.enable_debug,
-    )
-    if target_extent != image.extent:
+
+    tile_rows, tile_columns = seedvr2_tile_grid(seedvr2, target_extent)
+    row_count = max(1, min(tile_rows, image.extent.height, target_extent.height))
+    column_count = max(1, min(tile_columns, image.extent.width, target_extent.width))
+
+    if row_count == 1 and column_count == 1:
+        out_image = _seedvr2_upscale_tile(w, in_image, dit, vae, seedvr2, target_extent)
+    else:
+        source_grid = _grid_bounds(image.extent, row_count, column_count)
+        target_grid = [
+            [_map_bounds(bounds, image.extent, target_extent) for bounds in row]
+            for row in source_grid
+        ]
+        rows = []
+        for source_row, target_row in zip(source_grid, target_grid):
+            columns = []
+            for source_bounds, target_bounds in zip(source_row, target_row):
+                padded_source = _pad_bounds(source_bounds, image.extent, seedvr2.tile_overlap)
+                padded_target = _map_bounds(padded_source, image.extent, target_extent)
+                tile = w.crop_image(in_image, padded_source)
+                tile = _seedvr2_upscale_tile(w, tile, dit, vae, seedvr2, padded_target.extent)
+                if padded_target != target_bounds:
+                    tile = w.crop_image(
+                        tile,
+                        Bounds(
+                            target_bounds.x - padded_target.x,
+                            target_bounds.y - padded_target.y,
+                            target_bounds.width,
+                            target_bounds.height,
+                        ),
+                    )
+                columns.append(tile)
+            rows.append(w.image_stitch(columns, direction="right"))
+        out_image = w.image_stitch(rows, direction="down")
         out_image = w.scale_image(out_image, target_extent)
+
     w.send_image(out_image)
     return w
 

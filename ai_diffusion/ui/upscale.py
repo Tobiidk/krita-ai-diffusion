@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .. import workflow
 from ..jobs import JobKind
 from ..localization import translate as _
 from ..model import Model, TileOverlapMode, UpscaleRefineMode
@@ -264,6 +265,40 @@ class UpscaleWidget(QWidget):
         for value, text in _seedvr2_color_options:
             self.seedvr2_color_combo.addItem(text, value)
 
+        self.seedvr2_tile_auto = QCheckBox(_("Auto"), self)
+        self.seedvr2_tile_auto.setToolTip(
+            _(
+                "Automatically choose the SeedVR2 crop grid from the target aspect ratio. "
+                "Square images use 4x4; portrait images use rows x columns like 4x3."
+            )
+        )
+        self.seedvr2_tile_rows_input = QSpinBox(self)
+        self.seedvr2_tile_rows_input.setMinimum(1)
+        self.seedvr2_tile_rows_input.setMaximum(16)
+        self.seedvr2_tile_rows_input.setToolTip(
+            _(
+                "SeedVR2 crop-grid rows. The guide recommends 4x4 for square images; use 4x3 or 3x4 for non-square images."
+            )
+        )
+        self.seedvr2_tile_columns_input = QSpinBox(self)
+        self.seedvr2_tile_columns_input.setMinimum(1)
+        self.seedvr2_tile_columns_input.setMaximum(16)
+        self.seedvr2_tile_columns_input.setToolTip(
+            _(
+                "SeedVR2 crop-grid columns. The guide recommends 4x4 for square images; use 4x3 or 3x4 for non-square images."
+            )
+        )
+        self.seedvr2_tile_overlap_input = QSpinBox(self)
+        self.seedvr2_tile_overlap_input.setMinimum(0)
+        self.seedvr2_tile_overlap_input.setMaximum(512)
+        self.seedvr2_tile_overlap_input.setSingleStep(16)
+        self.seedvr2_tile_overlap_input.setSuffix(" px")
+        self.seedvr2_tile_overlap_input.setToolTip(
+            _(
+                "Extra source pixels included around each SeedVR2 crop before upscaling. Increase this to reduce visible grid seams."
+            )
+        )
+
         self.seedvr2_input_noise = QDoubleSpinBox(self)
         self.seedvr2_input_noise.setMinimum(0.0)
         self.seedvr2_input_noise.setMaximum(1.0)
@@ -294,6 +329,22 @@ class UpscaleWidget(QWidget):
         self.seedvr2_vae_tiled.setToolTip(
             _("Use tiled SeedVR2 VAE encode/decode to reduce VRAM usage at high resolutions.")
         )
+        self.seedvr2_vae_tile_size_input = QSpinBox(self)
+        self.seedvr2_vae_tile_size_input.setMinimum(256)
+        self.seedvr2_vae_tile_size_input.setMaximum(4096)
+        self.seedvr2_vae_tile_size_input.setSingleStep(128)
+        self.seedvr2_vae_tile_size_input.setSuffix(" px")
+        self.seedvr2_vae_tile_size_input.setToolTip(
+            _("SeedVR2 VAE tile size. Larger tiles can reduce seams but use more VRAM.")
+        )
+        self.seedvr2_vae_tile_overlap_input = QSpinBox(self)
+        self.seedvr2_vae_tile_overlap_input.setMinimum(0)
+        self.seedvr2_vae_tile_overlap_input.setMaximum(1024)
+        self.seedvr2_vae_tile_overlap_input.setSingleStep(32)
+        self.seedvr2_vae_tile_overlap_input.setSuffix(" px")
+        self.seedvr2_vae_tile_overlap_input.setToolTip(
+            _("SeedVR2 VAE tile overlap. More overlap can reduce seams but uses more memory.")
+        )
         self.seedvr2_debug = QCheckBox(_("Debug"), self)
         self.seedvr2_debug.setToolTip(_("Enable detailed SeedVR2 memory/timing logs."))
 
@@ -318,6 +369,17 @@ class UpscaleWidget(QWidget):
         seedvr2_layout.addLayout(seedvr2_offload_layout)
         seedvr2_layout.addLayout(self._row(_("Attention"), self.seedvr2_attention_combo))
         seedvr2_layout.addLayout(self._row(_("Color"), self.seedvr2_color_combo))
+        seedvr2_grid_layout = QHBoxLayout()
+        seedvr2_grid_layout.addWidget(QLabel(_("Crop Grid"), self), 1)
+        seedvr2_grid_layout.addWidget(self.seedvr2_tile_auto)
+        seedvr2_grid_layout.addWidget(self.seedvr2_tile_rows_input, 1)
+        seedvr2_grid_layout.addWidget(QLabel("x", self))
+        seedvr2_grid_layout.addWidget(self.seedvr2_tile_columns_input, 1)
+        seedvr2_layout.addLayout(seedvr2_grid_layout)
+        seedvr2_crop_overlap_layout = QHBoxLayout()
+        seedvr2_crop_overlap_layout.addWidget(QLabel(_("Crop Overlap"), self), 1)
+        seedvr2_crop_overlap_layout.addWidget(self.seedvr2_tile_overlap_input, 3)
+        seedvr2_layout.addLayout(seedvr2_crop_overlap_layout)
         seedvr2_noise_layout = QHBoxLayout()
         seedvr2_noise_layout.addWidget(QLabel(_("Input Noise"), self), 1)
         seedvr2_noise_layout.addWidget(self.seedvr2_input_noise, 1)
@@ -331,6 +393,19 @@ class UpscaleWidget(QWidget):
         seedvr2_options_layout.addWidget(self.seedvr2_vae_tiled)
         seedvr2_options_layout.addWidget(self.seedvr2_debug)
         seedvr2_layout.addLayout(seedvr2_options_layout)
+        seedvr2_tile_layout = QHBoxLayout()
+        seedvr2_tile_layout.addWidget(QLabel(_("VAE Tile"), self), 1)
+        seedvr2_tile_layout.addWidget(self.seedvr2_vae_tile_size_input, 1)
+        seedvr2_tile_layout.addWidget(QLabel(_("VAE Overlap"), self), 1)
+        seedvr2_tile_layout.addWidget(self.seedvr2_vae_tile_overlap_input, 1)
+        seedvr2_layout.addLayout(seedvr2_tile_layout)
+
+        self.seedvr2_target_label = QLabel(self)
+        self.seedvr2_target_label.setStyleSheet(f"color: {theme.grey}; font-size: 11px;")
+        self.seedvr2_target_label.setWordWrap(True)
+        seedvr2_layout.addWidget(
+            self.seedvr2_target_label, alignment=Qt.AlignmentFlag.AlignRight
+        )
         seedvr2_layout.addWidget(self.seedvr2_button)
         layout.addWidget(self.seedvr2_group)
 
@@ -352,6 +427,11 @@ class UpscaleWidget(QWidget):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedHeight(6)
         layout.addWidget(self.progress_bar)
+
+        self.progress_detail = QLabel(self)
+        self.progress_detail.setStyleSheet(f"color: {theme.grey}; font-size: 11px;")
+        self.progress_detail.setVisible(False)
+        layout.addWidget(self.progress_detail)
 
         self.error_box = ErrorBox(self)
         layout.addWidget(self.error_box)
@@ -406,6 +486,37 @@ class UpscaleWidget(QWidget):
                 bind(model.upscale, "seedvr2_blocks_to_swap", self.seedvr2_blocks_input, "value"),
                 bind_toggle(model.upscale, "seedvr2_swap_io_components", self.seedvr2_swap_io),
                 bind_toggle(model.upscale, "seedvr2_vae_tiled", self.seedvr2_vae_tiled),
+                bind_toggle(model.upscale, "seedvr2_tile_auto", self.seedvr2_tile_auto),
+                bind(
+                    model.upscale,
+                    "seedvr2_vae_tile_size",
+                    self.seedvr2_vae_tile_size_input,
+                    "value",
+                ),
+                bind(
+                    model.upscale,
+                    "seedvr2_vae_tile_overlap",
+                    self.seedvr2_vae_tile_overlap_input,
+                    "value",
+                ),
+                bind(
+                    model.upscale,
+                    "seedvr2_tile_rows",
+                    self.seedvr2_tile_rows_input,
+                    "value",
+                ),
+                bind(
+                    model.upscale,
+                    "seedvr2_tile_columns",
+                    self.seedvr2_tile_columns_input,
+                    "value",
+                ),
+                bind(
+                    model.upscale,
+                    "seedvr2_tile_overlap",
+                    self.seedvr2_tile_overlap_input,
+                    "value",
+                ),
                 bind_toggle(model.upscale, "seedvr2_enable_debug", self.seedvr2_debug),
                 bind(model.upscale, "can_generate", self.upscale_button, "enabled", Bind.one_way),
                 bind(model, "error", self.error_box, "error", Bind.one_way),
@@ -416,9 +527,20 @@ class UpscaleWidget(QWidget):
                 model.regions.added.connect(self._update_prompt),
                 model.regions.removed.connect(self._update_prompt),
                 model.progress_changed.connect(self.update_progress),
+                model.progress_details_changed.connect(self.update_progress),
                 model.style_changed.connect(self._update_style),
                 root.connection.models_changed.connect(self._sync_seedvr2_options),
                 model.upscale.can_generate_changed.connect(self._update_seedvr2_status),
+                model.upscale.target_extent_changed.connect(self._update_seedvr2_status),
+                model.upscale.seedvr2_tile_auto_changed.connect(self._update_seedvr2_status),
+                model.upscale.seedvr2_tile_rows_changed.connect(self._update_seedvr2_status),
+                model.upscale.seedvr2_tile_columns_changed.connect(self._update_seedvr2_status),
+                model.upscale.seedvr2_tile_auto_changed.connect(
+                    self._update_seedvr2_tile_options
+                ),
+                model.upscale.seedvr2_vae_tiled_changed.connect(
+                    self._update_seedvr2_tile_options
+                ),
             ]
             self.upscale_button.model = model
             self.seedvr2_button.model = model
@@ -431,6 +553,7 @@ class UpscaleWidget(QWidget):
             self._update_overlap()
             self._update_refine_mode()
             self._sync_seedvr2_options()
+            self._update_seedvr2_tile_options()
             self.update_progress()
 
     def update_models(self):
@@ -525,15 +648,59 @@ class UpscaleWidget(QWidget):
         if client := root.connection.client_if_connected:
             installed = "SeedVR2VideoUpscaler" in client.models.node_inputs
         self.seedvr2_button.setEnabled(self.model.upscale.can_generate and installed)
+        target = self.model.upscale.target_extent
+        factor = self.model.upscale.factor
+        if factor <= 1.0:
+            self.seedvr2_target_label.setStyleSheet(
+                f"color: {theme.yellow}; font-size: 11px;"
+            )
+        else:
+            self.seedvr2_target_label.setStyleSheet(f"color: {theme.grey}; font-size: 11px;")
+        if self.model.upscale.seedvr2_tile_auto:
+            rows, columns = workflow.seedvr2_auto_tile_grid(target)
+            grid_text = _("auto") + f" {rows}x{columns}"
+        else:
+            grid_text = (
+                f"{self.model.upscale.seedvr2_tile_rows}x"
+                f"{self.model.upscale.seedvr2_tile_columns}"
+            )
+        self.seedvr2_target_label.setText(
+            _("Target")
+            + f": {target.width} x {target.height} "
+            + f"({factor:.1f}x, {grid_text} "
+            + _("tiles")
+            + ")"
+        )
         if installed:
-            self.seedvr2_button.setToolTip("")
+            self.seedvr2_button.setToolTip(
+                _("Uses the current Scale value.")
+                + f" {target.width} x {target.height} ({factor:.1f}x)"
+            )
         else:
             self.seedvr2_button.setToolTip(
                 _("Install ComfyUI-SeedVR2_VideoUpscaler and restart the server to enable this.")
             )
 
     def update_progress(self):
-        self.progress_bar.setValue(int(self.model.progress * 100))
+        progress = self.model.progress
+        details = self.model.progress_details
+        detail_text = _progress_detail_text(
+            details.current_node, details.sample_step, details.sample_max
+        )
+
+        busy = progress < 0 or (
+            details.current_node in _seedvr2_progress_nodes
+            and details.sample_max == 0
+            and progress < 1.0
+        )
+        if busy:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(max(0, min(100, int(progress * 100))))
+
+        self.progress_detail.setText(detail_text)
+        self.progress_detail.setVisible(bool(detail_text))
 
     def upscale(self):
         self.model.upscale_image()
@@ -549,6 +716,14 @@ class UpscaleWidget(QWidget):
     def _update_refine_mode(self):
         is_tiled = self.model.upscale.refine_mode is UpscaleRefineMode.tiled
         self.overlap_widget.setVisible(is_tiled)
+
+    def _update_seedvr2_tile_options(self):
+        vae_enabled = self.model.upscale.seedvr2_vae_tiled
+        self.seedvr2_vae_tile_size_input.setEnabled(vae_enabled)
+        self.seedvr2_vae_tile_overlap_input.setEnabled(vae_enabled)
+        grid_enabled = not self.model.upscale.seedvr2_tile_auto
+        self.seedvr2_tile_rows_input.setEnabled(grid_enabled)
+        self.seedvr2_tile_columns_input.setEnabled(grid_enabled)
 
     def _update_style(self):
         arch = self.model.arch
@@ -594,6 +769,7 @@ class UpscaleWidget(QWidget):
             self.upscale_button.operation = _("Refine")
         else:
             self.upscale_button.operation = _("Upscale")
+        self._update_seedvr2_status()
 
 
 def _upscaler_order(filename: str):
@@ -633,3 +809,18 @@ _seedvr2_color_options = [
     ("adain", "AdaIN"),
     ("none", _("None")),
 ]
+
+_seedvr2_progress_nodes = {
+    "SeedVR2LoadDiTModel": _("SeedVR2: preparing DiT model"),
+    "SeedVR2LoadVAEModel": _("SeedVR2: preparing VAE model"),
+    "SeedVR2VideoUpscaler": _("SeedVR2: upscaling, decoding, and color matching"),
+}
+
+
+def _progress_detail_text(current_node: str, sample_step: int, sample_max: int):
+    if not current_node:
+        return ""
+    text = _seedvr2_progress_nodes.get(current_node, current_node)
+    if sample_step > 0 and sample_max > 0:
+        text += f"  {sample_step}/{sample_max}"
+    return text

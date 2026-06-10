@@ -199,6 +199,10 @@ class SeedVR2Input:
     vae_tiled: bool = True
     vae_tile_size: int = 1024
     vae_tile_overlap: int = 128
+    tile_auto: bool = True
+    tile_rows: int = 4
+    tile_columns: int = 4
+    tile_overlap: int = 64
     enable_debug: bool = False
 
 

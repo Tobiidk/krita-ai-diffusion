@@ -525,6 +525,15 @@ class Model(QObject, ObservableProperties):
         return input, job_params
 
     def seedvr2_upscale_image(self):
+        if self.upscale.factor <= 1.0:
+            self.report_error(
+                Error(
+                    ErrorKind.validation_warning,
+                    _("SeedVR2 would keep the current resolution. Set Scale above 1x first."),
+                )
+            )
+            return
+
         try:
             self.clear_error()
             inputs, job_params = self._prepare_seedvr2_upscale_image()
@@ -1357,6 +1366,12 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     seedvr2_input_noise_scale = Property(0.0, persist=True)
     seedvr2_latent_noise_scale = Property(0.0, persist=True)
     seedvr2_vae_tiled = Property(True, persist=True)
+    seedvr2_vae_tile_size = Property(1024, persist=True)
+    seedvr2_vae_tile_overlap = Property(128, persist=True)
+    seedvr2_tile_auto = Property(True, persist=True)
+    seedvr2_tile_rows = Property(4, persist=True)
+    seedvr2_tile_columns = Property(4, persist=True)
+    seedvr2_tile_overlap = Property(64, persist=True)
     seedvr2_enable_debug = Property(False, persist=True)
     can_generate = Property(True)
 
@@ -1386,6 +1401,12 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     seedvr2_input_noise_scale_changed = pyqtSignal(float)
     seedvr2_latent_noise_scale_changed = pyqtSignal(float)
     seedvr2_vae_tiled_changed = pyqtSignal(bool)
+    seedvr2_vae_tile_size_changed = pyqtSignal(int)
+    seedvr2_vae_tile_overlap_changed = pyqtSignal(int)
+    seedvr2_tile_auto_changed = pyqtSignal(bool)
+    seedvr2_tile_rows_changed = pyqtSignal(int)
+    seedvr2_tile_columns_changed = pyqtSignal(int)
+    seedvr2_tile_overlap_changed = pyqtSignal(int)
     seedvr2_enable_debug_changed = pyqtSignal(bool)
     target_extent_changed = pyqtSignal(Extent)
     can_generate_changed = pyqtSignal(bool)
@@ -1462,6 +1483,12 @@ class UpscaleWorkspace(QObject, ObservableProperties):
             input_noise_scale=self.seedvr2_input_noise_scale,
             latent_noise_scale=self.seedvr2_latent_noise_scale,
             vae_tiled=self.seedvr2_vae_tiled,
+            vae_tile_size=self.seedvr2_vae_tile_size,
+            vae_tile_overlap=self.seedvr2_vae_tile_overlap,
+            tile_auto=self.seedvr2_tile_auto,
+            tile_rows=self.seedvr2_tile_rows,
+            tile_columns=self.seedvr2_tile_columns,
+            tile_overlap=self.seedvr2_tile_overlap,
             enable_debug=self.seedvr2_enable_debug,
         )
         return SeedVR2Params(
