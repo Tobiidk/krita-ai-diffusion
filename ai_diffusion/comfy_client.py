@@ -119,15 +119,31 @@ class ProgressDetails:
 
 
 class Progress:
-    _nodes = 0
-    _samples = 0
     _info: JobInfo
     details: ProgressDetails
 
     def __init__(self, job_info: JobInfo, node_map: dict | None = None):
         self._info = job_info
         self._node_map = node_map or {}  # node_id -> class_type
+        self._nodes = 0
+        self._completed_samples = 0.0
+        self._current_sample = 0.0
+        self._current_sample_max = 0.0
+        self._current_sample_node = ""
         self.details = ProgressDetails()
+
+    def _finish_current_sample_node(self):
+        if self._current_sample_max > 0:
+            self._completed_samples += self._current_sample_max
+            self._current_sample = 0.0
+            self._current_sample_max = 0.0
+
+    def _set_current_node(self, node_id: str):
+        if node_id != self._current_sample_node:
+            self._finish_current_sample_node()
+            self._current_sample_node = node_id
+        if node_id and node_id in self._node_map:
+            self.details.current_node = self._node_map[node_id]
 
     def handle(self, msg: dict):
         id = msg["data"].get("prompt_id", None)
@@ -136,23 +152,34 @@ class Progress:
         if msg["type"] == "executing":
             self._nodes += 1
             node_id = msg["data"].get("node", "")
-            if node_id and node_id in self._node_map:
-                self.details.current_node = self._node_map[node_id]
+            self._set_current_node(node_id)
             self.details.sample_step = 0
             self.details.sample_max = 0
         elif msg["type"] == "execution_cached":
+            self._finish_current_sample_node()
             self._nodes += len(msg["data"]["nodes"])
         elif msg["type"] == "progress":
-            self._samples += 1
             data = msg["data"]
-            self.details.sample_step = data.get("value", self.details.sample_step)
-            self.details.sample_max = data.get("max", self.details.sample_max)
+            if node_id := data.get("node", ""):
+                self._set_current_node(node_id)
+            sample_step = data.get("value", self.details.sample_step)
+            sample_max = data.get("max", self.details.sample_max)
+            self.details.sample_step = sample_step
+            self.details.sample_max = sample_max
+            if sample_max > 0:
+                self._current_sample = min(max(float(sample_step), 0.0), float(sample_max))
+                self._current_sample_max = float(sample_max)
+            else:
+                self._current_sample += 1.0
 
     @property
     def value(self):
         # Add +1 to node count so progress doesn't go to 100% until images are received.
-        node_part = self._nodes / (self._info.node_count + 1)
-        sample_part = self._samples / max(self._info.sample_count, 1)
+        node_part = min(self._nodes / (self._info.node_count + 1), 1.0)
+        sample_part = (self._completed_samples + self._current_sample) / max(
+            self._info.sample_count, 1
+        )
+        sample_part = min(sample_part, 1.0)
         return 0.2 * node_part + 0.8 * sample_part
 
 

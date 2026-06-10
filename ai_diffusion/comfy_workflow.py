@@ -713,6 +713,7 @@ class ComfyWorkflow:
     ):
         if self.node_defs and "SeedVR2VideoUpscaler" not in self.node_defs:
             raise RuntimeError("ComfyUI-SeedVR2_VideoUpscaler is required for SeedVR2 upscale.")
+        self.sample_count += 100
         return self.add(
             "SeedVR2VideoUpscaler",
             1,

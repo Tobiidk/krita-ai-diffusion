@@ -14,7 +14,7 @@ from ai_diffusion.api import (
     WorkflowKind,
 )
 from ai_diffusion.client import ClientEvent, resolve_arch
-from ai_diffusion.comfy_client import ComfyClient, parse_url, websocket_url
+from ai_diffusion.comfy_client import ComfyClient, JobInfo, Progress, parse_url, websocket_url
 from ai_diffusion.files import File, FileFormat, FileLibrary
 from ai_diffusion.image import Extent
 from ai_diffusion.network import NetworkError
@@ -51,6 +51,31 @@ def make_default_work(size=512, steps=20):
         conditioning=ConditioningInput("a photo of a cat", "a photo of a dog"),
         sampling=SamplingInput("euler", "normal", cfg_scale=7.0, total_steps=steps),
     )
+
+
+def test_progress_uses_absolute_node_progress():
+    job = JobInfo(
+        "job-id",
+        make_default_work(),
+        node_count=3,
+        sample_count=200,
+        node_map={"1": "SeedVR2VideoUpscaler", "2": "SeedVR2VideoUpscaler"},
+    )
+    progress = Progress(job, job.node_map)
+
+    progress.handle({"type": "executing", "data": {"prompt_id": job.id, "node": "1"}})
+    progress.handle(
+        {"type": "progress", "data": {"prompt_id": job.id, "node": "1", "value": 100, "max": 100}}
+    )
+    progress.handle({"type": "executing", "data": {"prompt_id": job.id, "node": "2"}})
+    progress.handle(
+        {"type": "progress", "data": {"prompt_id": job.id, "node": "2", "value": 25, "max": 100}}
+    )
+
+    assert progress.details.current_node == "SeedVR2VideoUpscaler"
+    assert progress.details.sample_step == 25
+    assert progress.details.sample_max == 100
+    assert progress.value == pytest.approx(0.2 * (2 / 4) + 0.8 * (125 / 200))
 
 
 def test_connect_bad_url(qtapp, comfy_server):

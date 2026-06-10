@@ -255,6 +255,7 @@ def test_seedvr2_upscale_workflow():
 
     assert work.kind is WorkflowKind.seedvr2_upscale
     assert work.extent.target == Extent(1024, 1024)
+    assert graph.sample_count == 100
     assert "SeedVR2LoadDiTModel" in node_types
     assert "SeedVR2LoadVAEModel" in node_types
     assert upscaler["inputs"]["seed"] == 123
@@ -288,6 +289,7 @@ def test_seedvr2_tiled_upscale_workflow():
 
     assert work.extent.target == Extent(1024, 1024)
     assert len(upscalers) == 16
+    assert graph.sample_count == 1600
     assert len(crops) == 32
     assert len(stitches) == 15
     assert sorted({node["inputs"]["resolution"] for node in upscalers}) == [320, 384]
@@ -309,6 +311,7 @@ def test_seedvr2_auto_tile_grid_uses_target_aspect():
     assert work.extent.target == Extent(2750, 4096)
     assert workflow.seedvr2_auto_tile_grid(work.extent.target) == (4, 3)
     assert len(upscalers) == 12
+    assert graph.sample_count == 1200
     assert len(crops) == 12
     assert len(stitches) == 11
 

@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QSlider,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -17,7 +18,7 @@ from PyQt5.QtWidgets import (
 from .. import workflow
 from ..jobs import JobKind
 from ..localization import translate as _
-from ..model import Model, TileOverlapMode, UpscaleRefineMode
+from ..model import Model, TileOverlapMode, UpscaleRefineMode, UpscaleStage
 from ..properties import Bind, Binding, bind, bind_combo, bind_toggle
 from ..resources import ControlMode, UpscalerName
 from ..root import root
@@ -29,7 +30,6 @@ from .theme import SignalBlocker, set_text_clipped
 from .widget import (
     ErrorBox,
     GenerateButton,
-    QueueButton,
     LoraDockerPanel,
     StrengthWidget,
     StyleSelectWidget,
@@ -121,42 +121,41 @@ class UpscaleWidget(QWidget):
         super().__init__()
         self._model = root.active_model
         self._model_bindings = []
+        self._seedvr2_progress_active = False
         root.connection.state_changed.connect(self.update_models)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 2, 4, 0)
         self.setLayout(layout)
 
+        self.upscaler_group = QGroupBox(_("Upscale Model"), self)
         self.workspace_select = WorkspaceSelectWidget(self)
         self.model_select = QComboBox(self)
         model_layout = QHBoxLayout()
         model_layout.addWidget(self.workspace_select)
         model_layout.addWidget(self.model_select)
-        layout.addLayout(model_layout)
 
         self.factor_widget = FactorWidget(self)
         self.factor_widget.value_changed.connect(self._update_factor)
-        layout.addWidget(self.factor_widget)
 
-        self.noise_checkbox = QCheckBox(_("Inject Noise"), self)
-        self.noise_checkbox.setToolTip(
-            _("Add random noise before upscaling to reduce blurriness with some models")
+        self.upscaler_button = GenerateButton(JobKind.upscaling, self)
+        self.upscaler_button.operation = _("Run Upscaler")
+        self.upscaler_button.clicked.connect(self.upscale_model)
+
+        upscaler_layout = QVBoxLayout(self.upscaler_group)
+        upscaler_layout.addLayout(model_layout)
+        upscaler_layout.addWidget(self.factor_widget)
+        upscaler_layout.addWidget(self.upscaler_button)
+        layout.addWidget(self.upscaler_group)
+
+        self.link_upscaler_to_refine_button = self._create_link_button(
+            _("Link Upscale Model to Flux Refine")
         )
-        layout.addWidget(self.noise_checkbox)
-
-        self.noise_slider = StrengthWidget(
-            slider_range=(1, 30), prefix=False, parent=self
+        layout.addWidget(
+            self.link_upscaler_to_refine_button, alignment=Qt.AlignmentFlag.AlignHCenter
         )
-        noise_layout = QHBoxLayout()
-        noise_layout.addWidget(QLabel(_("Noise Strength"), self), 1)
-        noise_layout.addWidget(self.noise_slider, 3)
-        self._noise_layout_widget = QWidget(self)
-        self._noise_layout_widget.setLayout(noise_layout)
-        self._noise_layout_widget.setVisible(False)
-        layout.addWidget(self._noise_layout_widget)
 
-        self.refinement_checkbox = QGroupBox(_("Refine upscaled image"), self)
-        self.refinement_checkbox.setCheckable(True)
+        self.refinement_group = QGroupBox(_("Flux Refine"), self)
 
         self.style_select = StyleSelectWidget(self)
         self.refine_mode_combo = NoWheelComboBox(self)
@@ -237,7 +236,11 @@ class UpscaleWidget(QWidget):
         prompt_layout.addWidget(self.use_prompt_value)
         prompt_layout.addWidget(self.use_prompt_switch)
 
-        group_layout = QVBoxLayout(self.refinement_checkbox)
+        self.flux_refine_button = GenerateButton(JobKind.upscaling, self)
+        self.flux_refine_button.operation = _("Run Flux Refine")
+        self.flux_refine_button.clicked.connect(self.flux_refine)
+
+        group_layout = QVBoxLayout(self.refinement_group)
         group_layout.addWidget(self.style_select)
         group_layout.addLayout(refine_mode_layout)
         group_layout.addLayout(sampler_layout)
@@ -247,9 +250,17 @@ class UpscaleWidget(QWidget):
         group_layout.addWidget(self.lora_panel)
         group_layout.addWidget(self.overlap_widget)
         group_layout.addLayout(prompt_layout)
-        self.refinement_checkbox.setLayout(group_layout)
-        layout.addWidget(self.refinement_checkbox)
+        group_layout.addWidget(self.flux_refine_button)
+        self.refinement_group.setLayout(group_layout)
+        layout.addWidget(self.refinement_group)
         self.factor_widget.input.setMinimumWidth(self.strength_slider._input.width() + 10)
+
+        self.link_refine_to_seedvr2_button = self._create_link_button(
+            _("Link Flux Refine to SeedVR2")
+        )
+        layout.addWidget(
+            self.link_refine_to_seedvr2_button, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
 
         self.seedvr2_group = QGroupBox(_("SeedVR2 Final Upscale"), self)
         self.seedvr2_dit_combo = NoWheelComboBox(self)
@@ -409,17 +420,10 @@ class UpscaleWidget(QWidget):
         seedvr2_layout.addWidget(self.seedvr2_button)
         layout.addWidget(self.seedvr2_group)
 
-        self.upscale_button = GenerateButton(JobKind.upscaling, self)
-        self.upscale_button.operation = _("Upscale")
-        self.upscale_button.clicked.connect(self.upscale)
-
-        self.queue_button = QueueButton(supports_batch=False, parent=self)
-        self.queue_button.setFixedHeight(self.upscale_button.height() - 2)
-
-        actions_layout = QHBoxLayout()
-        actions_layout.addWidget(self.upscale_button)
-        actions_layout.addWidget(self.queue_button)
-        layout.addLayout(actions_layout)
+        self.upscale_flow_button = GenerateButton(JobKind.upscaling, self)
+        self.upscale_flow_button.operation = _("Run Linked Flow")
+        self.upscale_flow_button.clicked.connect(self.upscale_flow)
+        layout.addWidget(self.upscale_flow_button)
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setMinimum(0)
@@ -438,6 +442,18 @@ class UpscaleWidget(QWidget):
 
         layout.addStretch()
 
+    def _create_link_button(self, tooltip: str):
+        button = QToolButton(self)
+        button.setCheckable(True)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setIcon(theme.icon("link-off"))
+        button.setToolTip(tooltip)
+        button.toggled.connect(lambda checked: self._update_link_icon(button, checked))
+        return button
+
+    def _update_link_icon(self, button: QToolButton, checked: bool):
+        button.setIcon(theme.icon("link-active" if checked else "link-off"))
+
     @property
     def model(self):
         return self._model
@@ -451,9 +467,16 @@ class UpscaleWidget(QWidget):
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
                 bind_combo(model.upscale, "upscaler", self.model_select),
                 bind(model.upscale, "factor", self.factor_widget, "value"),
-                bind_toggle(model.upscale, "inject_noise", self.noise_checkbox),
-                bind(model.upscale, "noise_strength", self.noise_slider, "value"),
-                bind_toggle(model.upscale, "use_diffusion", self.refinement_checkbox),
+                bind_toggle(
+                    model.upscale,
+                    "link_upscaler_to_refine",
+                    self.link_upscaler_to_refine_button,
+                ),
+                bind_toggle(
+                    model.upscale,
+                    "link_refine_to_seedvr2",
+                    self.link_refine_to_seedvr2_button,
+                ),
                 bind_combo(model.upscale, "refine_mode", self.refine_mode_combo),
                 bind(model, "style", self.style_select, "value"),
                 bind_combo(model.upscale, "sampler_preset", self.sampler_select),
@@ -518,7 +541,23 @@ class UpscaleWidget(QWidget):
                     "value",
                 ),
                 bind_toggle(model.upscale, "seedvr2_enable_debug", self.seedvr2_debug),
-                bind(model.upscale, "can_generate", self.upscale_button, "enabled", Bind.one_way),
+                bind(
+                    model.upscale, "can_generate", self.upscaler_button, "enabled", Bind.one_way
+                ),
+                bind(
+                    model.upscale,
+                    "can_generate",
+                    self.flux_refine_button,
+                    "enabled",
+                    Bind.one_way,
+                ),
+                bind(
+                    model.upscale,
+                    "can_generate",
+                    self.upscale_flow_button,
+                    "enabled",
+                    Bind.one_way,
+                ),
                 bind(model, "error", self.error_box, "error", Bind.one_way),
                 model.upscale.tile_overlap_mode_changed.connect(self._update_overlap),
                 model.upscale.refine_mode_changed.connect(self._update_refine_mode),
@@ -531,7 +570,12 @@ class UpscaleWidget(QWidget):
                 model.style_changed.connect(self._update_style),
                 root.connection.models_changed.connect(self._sync_seedvr2_options),
                 model.upscale.can_generate_changed.connect(self._update_seedvr2_status),
+                model.upscale.can_generate_changed.connect(self._update_flow_button),
                 model.upscale.target_extent_changed.connect(self._update_seedvr2_status),
+                model.upscale.link_upscaler_to_refine_changed.connect(
+                    self._update_flow_button
+                ),
+                model.upscale.link_refine_to_seedvr2_changed.connect(self._update_flow_button),
                 model.upscale.seedvr2_tile_auto_changed.connect(self._update_seedvr2_status),
                 model.upscale.seedvr2_tile_rows_changed.connect(self._update_seedvr2_status),
                 model.upscale.seedvr2_tile_columns_changed.connect(self._update_seedvr2_status),
@@ -542,18 +586,18 @@ class UpscaleWidget(QWidget):
                     self._update_seedvr2_tile_options
                 ),
             ]
-            self.upscale_button.model = model
+            self.upscaler_button.model = model
+            self.flux_refine_button.model = model
             self.seedvr2_button.model = model
-            self.queue_button.model = model
+            self.upscale_flow_button.model = model
             self.lora_panel.model = model
-            self.noise_checkbox.toggled.connect(self._noise_layout_widget.setVisible)
-            self._noise_layout_widget.setVisible(model.upscale.inject_noise)
             self._update_prompt()
             self._update_style()
             self._update_overlap()
             self._update_refine_mode()
             self._sync_seedvr2_options()
             self._update_seedvr2_tile_options()
+            self._update_flow_button()
             self.update_progress()
 
     def update_models(self):
@@ -643,10 +687,13 @@ class UpscaleWidget(QWidget):
         )
         self._update_seedvr2_status()
 
-    def _update_seedvr2_status(self):
-        installed = False
+    def _seedvr2_installed(self):
         if client := root.connection.client_if_connected:
-            installed = "SeedVR2VideoUpscaler" in client.models.node_inputs
+            return "SeedVR2VideoUpscaler" in client.models.node_inputs
+        return False
+
+    def _update_seedvr2_status(self):
+        installed = self._seedvr2_installed()
         self.seedvr2_button.setEnabled(self.model.upscale.can_generate and installed)
         target = self.model.upscale.target_extent
         factor = self.model.upscale.factor
@@ -680,6 +727,44 @@ class UpscaleWidget(QWidget):
             self.seedvr2_button.setToolTip(
                 _("Install ComfyUI-SeedVR2_VideoUpscaler and restart the server to enable this.")
             )
+        self._update_flow_button()
+
+    def _flow_stages(self):
+        stages = []
+        if self.model.upscale.link_upscaler_to_refine:
+            stages.extend([UpscaleStage.model, UpscaleStage.refine])
+        if self.model.upscale.link_refine_to_seedvr2:
+            if len(stages) == 0:
+                stages.append(UpscaleStage.refine)
+            stages.append(UpscaleStage.seedvr2)
+        return stages
+
+    def _update_flow_button(self):
+        stages = self._flow_stages()
+        labels = {
+            UpscaleStage.model: _("Upscaler"),
+            UpscaleStage.refine: _("Flux"),
+            UpscaleStage.seedvr2: _("SeedVR2"),
+        }
+        if stages:
+            self.upscale_flow_button.operation = _("Run") + " " + " + ".join(
+                labels[stage] for stage in stages
+            )
+        else:
+            self.upscale_flow_button.operation = _("Select Linked Steps")
+        needs_seedvr2 = UpscaleStage.seedvr2 in stages
+        installed = not needs_seedvr2 or self._seedvr2_installed()
+        self.upscale_flow_button.setEnabled(
+            self.model.upscale.can_generate and len(stages) > 0 and installed
+        )
+        if needs_seedvr2 and not installed:
+            self.upscale_flow_button.setToolTip(
+                _("Install ComfyUI-SeedVR2_VideoUpscaler and restart the server to enable this.")
+            )
+        else:
+            self.upscale_flow_button.setToolTip(
+                _("Runs the stages connected by the enabled link buttons.")
+            )
 
     def update_progress(self):
         progress = self.model.progress
@@ -688,10 +773,16 @@ class UpscaleWidget(QWidget):
             details.current_node, details.sample_step, details.sample_max
         )
 
+        is_seedvr2_node = details.current_node in _seedvr2_progress_nodes
+        if is_seedvr2_node:
+            self._seedvr2_progress_active = True
+        if self.model.upscale.can_generate:
+            self._seedvr2_progress_active = False
+
         busy = progress < 0 or (
-            details.current_node in _seedvr2_progress_nodes
-            and details.sample_max == 0
-            and progress < 1.0
+            self._seedvr2_progress_active
+            and not self.model.upscale.can_generate
+            and (progress <= 0 or progress >= 1)
         )
         if busy:
             self.progress_bar.setRange(0, 0)
@@ -702,11 +793,19 @@ class UpscaleWidget(QWidget):
         self.progress_detail.setText(detail_text)
         self.progress_detail.setVisible(bool(detail_text))
 
-    def upscale(self):
-        self.model.upscale_image()
+    def upscale_model(self):
+        self.model.upscale_model_image()
+
+    def flux_refine(self):
+        self.model.upscale_refine_image()
+
+    def upscale_flow(self):
+        self.model.run_upscale_flow(self._flow_stages())
 
     def seedvr2_upscale(self):
+        self._seedvr2_progress_active = True
         self.model.seedvr2_upscale_image()
+        self.update_progress()
 
     def _update_overlap(self):
         self.overlap_input.setEnabled(
@@ -765,11 +864,8 @@ class UpscaleWidget(QWidget):
         set_text_clipped(self.prompt_label, text, padding=padding)
 
     def _update_factor(self):
-        if self.factor_widget.value == 1.0 and self.model.upscale.use_diffusion:
-            self.upscale_button.operation = _("Refine")
-        else:
-            self.upscale_button.operation = _("Upscale")
         self._update_seedvr2_status()
+        self._update_flow_button()
 
 
 def _upscaler_order(filename: str):
@@ -813,7 +909,7 @@ _seedvr2_color_options = [
 _seedvr2_progress_nodes = {
     "SeedVR2LoadDiTModel": _("SeedVR2: preparing DiT model"),
     "SeedVR2LoadVAEModel": _("SeedVR2: preparing VAE model"),
-    "SeedVR2VideoUpscaler": _("SeedVR2: upscaling, decoding, and color matching"),
+    "SeedVR2VideoUpscaler": _("SeedVR2: downloading/loading/running upscaler"),
 }
 
 

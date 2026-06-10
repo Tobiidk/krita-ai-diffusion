@@ -81,6 +81,12 @@ class QueueMode(Enum):
     replace = 2
 
 
+class UpscaleStage(Enum):
+    model = 0
+    refine = 1
+    seedvr2 = 2
+
+
 class Workspace(Enum):
     generation = 0
     upscaling = 1
@@ -209,8 +215,11 @@ class Model(QObject, ObservableProperties):
         self.custom = CustomWorkspace(workflows, self._generate_custom, self.jobs)
         self._style_connection: QMetaObject.Connection | None = None
         self._progress_details = ProgressDetails()
+        self._upscale_flow: deque[UpscaleStage] = deque()
+        self._upscale_flow_job: Job | None = None
 
         self.jobs.selection_changed.connect(self.update_preview)
+        self.jobs.job_finished.connect(self._handle_upscale_flow_finished)
         connection.state_changed.connect(self._init_on_connect)
         connection.error_changed.connect(self._forward_error)
         self.custom.validation_error_changed.connect(self._forward_validation_error)
@@ -438,19 +447,30 @@ class Model(QObject, ObservableProperties):
         client = self._connection.client
         job.id = await client.enqueue(input, front)
 
-    def _prepare_upscale_image(self, dryrun=False, factor_override: float | None = None):
+    def _prepare_upscale_image(
+        self,
+        dryrun=False,
+        factor_override: float | None = None,
+        use_diffusion_override: bool | None = None,
+        use_upscale_model: bool = True,
+    ):
         client = self._connection.client
         extent = self._doc.extent
         image = self._doc.get_image(Bounds(0, 0, *extent)) if not dryrun else DummyImage(extent)
         params = self.upscale.params
+        if use_diffusion_override is not None:
+            params = replace(params, use_diffusion=use_diffusion_override)
         if factor_override is not None:
             target = extent * factor_override
             params = replace(params, factor=factor_override, target_extent=target)
-        params.upscale.model = params.upscale.model or client.models.default_upscaler
-        if params.upscale.model not in client.models.upscalers:
-            msg = _("The upscale model used by the document is not available on the server")
-            self.report_error(Error(ErrorKind.warning, msg + f": {params.upscale.model}"))
-            self.upscale.upscaler = params.upscale.model = client.models.default_upscaler
+        if use_upscale_model:
+            params.upscale.model = params.upscale.model or client.models.default_upscaler
+            if params.upscale.model not in client.models.upscalers:
+                msg = _("The upscale model used by the document is not available on the server")
+                self.report_error(Error(ErrorKind.warning, msg + f": {params.upscale.model}"))
+                self.upscale.upscaler = params.upscale.model = client.models.default_upscaler
+        else:
+            params.upscale.model = ""
         bounds = Bounds(0, 0, *self._doc.extent)
         sys_prompt = "4k uhd"
         if self.arch.is_edit:
@@ -524,7 +544,23 @@ class Model(QObject, ObservableProperties):
         job_params = JobParams(target_bounds, name, seed=params.seed)
         return input, job_params
 
-    def seedvr2_upscale_image(self):
+    def _queue_upscale_job(
+        self, inputs: WorkflowInput, job_params: JobParams, reset_factor: bool = True
+    ):
+        job = self.jobs.add(JobKind.upscaling, job_params)
+        self.upscale.set_in_progress(True)
+        eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
+
+        self._doc.resize(job.params.bounds.extent)
+        if reset_factor and self.upscale.factor != 1.0:
+            self.upscale.factor = 1.0
+        else:
+            self.upscale.target_extent_changed.emit(self.upscale.target_extent)
+        return job
+
+    def seedvr2_upscale_image(self, from_flow=False, reset_factor=True):
+        if not from_flow:
+            self._clear_upscale_flow()
         if self.upscale.factor <= 1.0:
             self.report_error(
                 Error(
@@ -537,75 +573,93 @@ class Model(QObject, ObservableProperties):
         try:
             self.clear_error()
             inputs, job_params = self._prepare_seedvr2_upscale_image()
-            job = self.jobs.add(JobKind.upscaling, job_params)
         except Exception as e:
             self.report_error(util.log_error(e))
-            return
-
-        self.upscale.set_in_progress(True)
-        eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
-
-        self._doc.resize(job.params.bounds.extent)
-        if self.upscale.factor != 1.0:
-            self.upscale.factor = 1.0
-        else:
-            self.upscale.target_extent_changed.emit(self.upscale.target_extent)
+            return None
+        return self._queue_upscale_job(inputs, job_params, reset_factor)
 
     def upscale_image(self):
-        factor_override = None
-        if self.upscale.inject_noise:
-            try:
-                target = self.upscale.target_extent
-                if target != self._doc.extent:
-                    self._doc.resize(target)
-                self._inject_noise_layer(self.upscale.noise_strength)
-                factor_override = 1.0
-            except Exception as e:
-                self.report_error(util.log_error(e))
-                return
+        self._clear_upscale_flow()
+        try:
+            self.clear_error()
+            inputs, job_params = self._prepare_upscale_image()
+        except Exception as e:
+            self.report_error(util.log_error(e))
+            return None
+        return self._queue_upscale_job(inputs, job_params)
 
+    def upscale_model_image(self, from_flow=False, reset_factor=True):
+        if not from_flow:
+            self._clear_upscale_flow()
+        if self.upscale.factor <= 1.0:
+            self.report_error(
+                Error(
+                    ErrorKind.validation_warning,
+                    _("Set Scale above 1x to run the upscaler stage."),
+                )
+            )
+            return None
         try:
             self.clear_error()
             inputs, job_params = self._prepare_upscale_image(
-                factor_override=factor_override
+                use_diffusion_override=False,
+                use_upscale_model=True,
             )
-            job = self.jobs.add(JobKind.upscaling, job_params)
         except Exception as e:
             self.report_error(util.log_error(e))
+            return None
+        return self._queue_upscale_job(inputs, job_params, reset_factor)
+
+    def upscale_refine_image(self, from_flow=False, reset_factor=True):
+        if not from_flow:
+            self._clear_upscale_flow()
+        try:
+            self.clear_error()
+            inputs, job_params = self._prepare_upscale_image(
+                factor_override=1.0,
+                use_diffusion_override=True,
+                use_upscale_model=False,
+            )
+        except Exception as e:
+            self.report_error(util.log_error(e))
+            return None
+        return self._queue_upscale_job(inputs, job_params, reset_factor)
+
+    def run_upscale_flow(self, stages: list[UpscaleStage]):
+        self._clear_upscale_flow()
+        self._upscale_flow = deque(stages)
+        if len(self._upscale_flow) == 0:
+            self.report_error(
+                Error(ErrorKind.validation_warning, _("Select linked upscale stages first."))
+            )
             return
+        self._run_next_upscale_flow_stage()
 
-        self.upscale.set_in_progress(True)
-        eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
-
-        self._doc.resize(job.params.bounds.extent)
-        if factor_override is None and self.upscale.factor != 1.0:
-            self.upscale.factor = 1.0
+    def _run_next_upscale_flow_stage(self):
+        if len(self._upscale_flow) == 0:
+            self._upscale_flow_job = None
+            return
+        stage = self._upscale_flow.popleft()
+        reset_factor = len(self._upscale_flow) == 0
+        if stage is UpscaleStage.model:
+            job = self.upscale_model_image(from_flow=True, reset_factor=reset_factor)
+        elif stage is UpscaleStage.refine:
+            job = self.upscale_refine_image(from_flow=True, reset_factor=reset_factor)
         else:
-            self.upscale.target_extent_changed.emit(self.upscale.target_extent)
+            job = self.seedvr2_upscale_image(from_flow=True, reset_factor=reset_factor)
+        if job is None:
+            self._clear_upscale_flow()
+        else:
+            self._upscale_flow_job = job
 
-    def _inject_noise_layer(self, opacity_factor: float):
-        """Create a paint layer with Gaussian noise at the given opacity (0-1)."""
-        import random
-        import struct
+    def _handle_upscale_flow_finished(self, job: Job):
+        if job is self._upscale_flow_job:
+            self._upscale_flow_job = None
+            self._run_next_upscale_flow_stage()
 
-        from PyQt5.QtCore import QByteArray
-
-        extent = self._doc.extent
-        image = self._doc.get_image(Bounds(0, 0, *extent))
-        src = bytes(image.data)
-        pixel_count = extent.width * extent.height * 4
-
-        # Generate noisy version: add Gaussian noise (std=128) per channel, clamp 0-255
-        result = bytearray(pixel_count)
-        gauss = random.gauss
-        for i in range(pixel_count):
-            val = src[i] + int(gauss(0, 128))
-            result[i] = max(0, min(255, val))
-
-        noisy_image = Image.from_packed_bytes(QByteArray(bytes(result)), extent, channels=4)
-        bounds = Bounds(0, 0, *extent)
-        layer = self.layers.create("Noise Injection", noisy_image, bounds, make_active=False)
-        layer.node.setOpacity(int(opacity_factor * 255))
+    def _clear_upscale_flow(self):
+        self._upscale_flow.clear()
+        self._upscale_flow_job = None
 
     def estimate_cost(self, kind=JobKind.diffusion):
         try:
@@ -883,6 +937,8 @@ class Model(QObject, ObservableProperties):
     def _finish_job(self, job: Job, event: ClientEvent):
         if job.kind is JobKind.upscaling:
             self.upscale.set_in_progress(False)
+            if event is not ClientEvent.finished and job is self._upscale_flow_job:
+                self._clear_upscale_flow()
 
         self._progress_details = ProgressDetails()
         self.progress_details_changed.emit()
@@ -1351,6 +1407,8 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     use_prompt = Property(False, persist=True)
     prompt = Property("", persist=True)
     sampler_preset = Property("", persist=True)
+    link_upscaler_to_refine = Property(False, persist=True)
+    link_refine_to_seedvr2 = Property(False, persist=True)
     inject_noise = Property(False, persist=True)
     noise_strength = Property(0.1, persist=True)
     seedvr2_dit_model = Property("seedvr2_ema_3b_fp8_e4m3fn.safetensors", persist=True)
@@ -1386,6 +1444,8 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     use_prompt_changed = pyqtSignal(bool)
     prompt_changed = pyqtSignal(str)
     sampler_preset_changed = pyqtSignal(str)
+    link_upscaler_to_refine_changed = pyqtSignal(bool)
+    link_refine_to_seedvr2_changed = pyqtSignal(bool)
     inject_noise_changed = pyqtSignal(bool)
     noise_strength_changed = pyqtSignal(float)
     seedvr2_dit_model_changed = pyqtSignal(str)
